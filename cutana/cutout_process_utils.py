@@ -16,25 +16,55 @@ This module provides common functions used by both regular and streaming cutout 
 
 import os
 import time
+import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import numpy as np
 from dotmap import DotMap
 from loguru import logger
 
+from .catalogue_preprocessor import parse_fits_file_paths
 from .cutout_extraction import extract_cutouts_batch_vectorized
 from .fits_dataset import prepare_fits_sets_and_sources
 from .image_processor import (
     apply_normalisation,
     combine_channels,
-    convert_data_type,
     resize_batch_tensor,
 )
 from .job_tracker import JobTracker
 from .performance_profiler import ContextProfiler, PerformanceProfiler
+from .profiling_types import Stage
 from .system_monitor import SystemMonitor
-from .validate_config import validate_channel_order_consistency
+
+
+def _extract_tile_basename(fits_file_paths: Any) -> str:
+    """
+    Extract the tile basename(s) from a source's fits_file_paths field.
+
+    For single-channel sources this returns the FITS filename (basename). Multi-channel
+    sources return a comma-separated string of all channel filenames so the exact
+    tile set is preserved in the per-source metadata.
+
+    Args:
+        fits_file_paths: Raw fits_file_paths value from the source record. Accepts
+            the string-encoded list (e.g. "['a.fits', 'b.fits']"), a list, or a bare
+            path string.
+
+    Returns:
+        Comma-separated basenames of the source's FITS files.
+
+    Raises:
+        ValueError: If ``fits_file_paths`` is None, malformed, or parses to an empty
+            list. Every source must have at least one valid FITS file path — a
+            missing or empty value is a broken invariant, not a recoverable state.
+    """
+    if fits_file_paths is None:
+        raise ValueError("fits_file_paths is required for tile metadata extraction")
+    paths = parse_fits_file_paths(fits_file_paths, normalize=False)
+    if not paths:
+        raise ValueError(f"fits_file_paths parsed to empty list: {fits_file_paths!r}")
+    return ",".join(os.path.basename(p) for p in paths)
 
 
 def _set_thread_limits_for_process(system_monitor=None, thread_override=None):
@@ -162,8 +192,6 @@ def _process_source_sub_batch(
             logger.warning(f"{process_name}: Memory reporting returned False - check JobTracker")
     except Exception as e:
         logger.error(f"Failed to report peak memory usage: {e}")
-        import traceback
-
         logger.error(f"Full traceback: {traceback.format_exc()}")
 
     # Process each FITS file set with all sources that use it
@@ -227,8 +255,6 @@ def _process_source_sub_batch(
                 logger.debug(f"{process_name}: Memory sampling success: {success}")
             except Exception as e:
                 logger.error(f"Failed to sample memory during processing: {e}")
-                import traceback
-
                 logger.error(f"Full traceback: {traceback.format_exc()}")
 
             # Note: FITS file memory management is now handled at process level
@@ -238,6 +264,73 @@ def _process_source_sub_batch(
             continue
 
     return sub_batch_results
+
+
+class _OriginalSizes(NamedTuple):
+    """Per-source original cutout sizes plus aggregated diagnostics for one batch."""
+
+    sizes: np.ndarray  # int px per source; 0 means "no usable size" (→ None downstream)
+    n_no_scale: int  # arcsec-sized sources with no pixel scale available
+    n_subpixel: int  # arcsec-sized sources whose diameter rounds below one pixel
+
+
+def _compute_original_sizes(
+    diameter_pixels: np.ndarray,
+    diameter_arcsecs: np.ndarray,
+    pixel_scale: Optional[float],
+) -> _OriginalSizes:
+    """Resolve the per-source original cutout size (px) for metadata and resize math.
+
+    Precedence: an explicit ``diameter_pixel`` always wins (independent of the pixel
+    scale); otherwise fall back to ``round(diameter_arcsec / pixel_scale)``. Sources
+    with no usable size — no diameter at all, no pixel scale for an arcsec value, or
+    an arcsec value that rounds below one pixel — get 0, which the caller maps to
+    ``original_cutout_size = None``. Those cutouts are still extracted upstream
+    (clamped to >= 1 px); only the recorded original size is undefined.
+
+    Sizes are assigned through boolean masks rather than ``np.where``: ``np.where``
+    evaluates both branches and would cast an all-NaN array to int for every source
+    lacking a column, emitting a spurious "invalid value encountered in cast"
+    warning. Masking only ever casts the finite, in-mask subset, so it never fires.
+
+    Args:
+        diameter_pixels: Per-source diameter in pixels, NaN where absent.
+        diameter_arcsecs: Per-source diameter in arcsec, NaN where absent.
+        pixel_scale: Tile pixel scale (arcsec/px), or None when no WCS is available.
+
+    Returns:
+        An ``_OriginalSizes`` with the int size array and the counts of sources that
+        ended up without a usable size, broken down by cause for one-per-batch warns.
+
+    Raises:
+        ValueError: If a degenerate pixel scale (<= 0 or non-finite) would be used
+            for an arcsec→pixel conversion. A broken WCS is a hard fault, not a
+            recoverable per-source condition, so it must stop the run loudly.
+    """
+    n_sources = diameter_pixels.shape[0]
+    sizes = np.zeros(n_sources, dtype=int)
+
+    have_pixel = ~np.isnan(diameter_pixels)
+    sizes[have_pixel] = diameter_pixels[have_pixel].astype(int)
+
+    from_arcsec = ~have_pixel & ~np.isnan(diameter_arcsecs)
+    n_arcsec = int(np.count_nonzero(from_arcsec))
+
+    if pixel_scale is None:
+        # No WCS → arcsec values cannot be converted; those sources have no size.
+        return _OriginalSizes(sizes, n_no_scale=n_arcsec, n_subpixel=0)
+
+    if n_arcsec:
+        if not np.isfinite(pixel_scale) or pixel_scale <= 0:
+            raise ValueError(
+                f"Degenerate pixel scale {pixel_scale!r} arcsec/px for {n_arcsec} "
+                "arcsec-sized source(s): the tile WCS is invalid, so diameter_arcsec "
+                "cannot be converted to pixels."
+            )
+        sizes[from_arcsec] = np.round(diameter_arcsecs[from_arcsec] / pixel_scale).astype(int)
+
+    n_subpixel = int(np.count_nonzero(from_arcsec & (sizes == 0)))
+    return _OriginalSizes(sizes, n_no_scale=0, n_subpixel=n_subpixel)
 
 
 def _process_sources_batch_vectorized_with_fits_set(
@@ -285,7 +378,7 @@ def _process_sources_batch_vectorized_with_fits_set(
     all_source_offsets = {}  # source_id -> {"x": offset_x, "y": offset_y}
 
     # Process each FITS file in the set using vectorized batch processing
-    with ContextProfiler(profiler, "CutoutExtraction"):
+    with ContextProfiler(profiler, Stage.CUTOUT_EXTRACTION):
         for fits_path, (hdul, wcs_dict) in loaded_fits_data.items():
             logger.debug(
                 f"Vectorized processing {len(sources_batch)} sources from {Path(fits_path).name}"
@@ -343,7 +436,7 @@ def _process_sources_batch_vectorized_with_fits_set(
 
     # Resize all cutouts to tensor format
     if not config.do_only_cutout_extraction:
-        with ContextProfiler(profiler, "ImageResizing"):
+        with ContextProfiler(profiler, Stage.IMAGE_RESIZING):
             batch_cutouts = resize_batch_tensor(
                 all_source_cutouts,
                 target_resolution,
@@ -351,18 +444,12 @@ def _process_sources_batch_vectorized_with_fits_set(
                 flux_conserved_resizing,
                 pixel_scales_dict,
             )
-    # Get the actual extension names in deterministic order (same as resize_batch_tensor)
-    tensor_channel_names = []
-    for source_cutouts_dict in all_source_cutouts.values():
-        for ext_name in source_cutouts_dict.keys():
-            if ext_name not in tensor_channel_names:
-                tensor_channel_names.append(ext_name)
-
-    # Validate that channel order in data matches channel_weights order (only for multi-channel)
-    if len(channel_weights) > 1:
-        # Use dedicated validation function
-
-        validate_channel_order_consistency(tensor_channel_names, channel_weights)
+    # Extension names in deterministic order (same mapping resize_batch_tensor
+    # uses). Every source carries the same extensions in the same order, so the
+    # first source defines the tensor's column order for the whole batch.
+    tensor_channel_names = (
+        list(next(iter(all_source_cutouts.values()))) if all_source_cutouts else []
+    )
 
     # Report stage: combining channels
     if process_name and job_tracker:
@@ -371,24 +458,19 @@ def _process_sources_batch_vectorized_with_fits_set(
     # Apply batch channel combination
     source_ids = list(all_source_cutouts.keys())
     if not config.do_only_cutout_extraction:
-        with ContextProfiler(profiler, "ChannelMixing"):
-            cutouts_batch = combine_channels(batch_cutouts, channel_weights)
+        with ContextProfiler(profiler, Stage.CHANNEL_MIXING):
+            # Resolve weights from labels already in memory; no catalogue or FITS I/O is needed.
+            cutouts_batch = combine_channels(batch_cutouts, channel_weights, tensor_channel_names)
 
-        # Report stage: applying normalization
+        # Report stage: applying normalization and data type conversion
         if process_name and job_tracker:
-            _report_stage(process_name, "Applying normalization", job_tracker)
+            _report_stage(
+                process_name, "Applying normalization and data type conversion", job_tracker
+            )
 
-        # Normalization
-        with ContextProfiler(profiler, "Normalisation"):
-            processed_cutouts_batch = apply_normalisation(cutouts_batch, config)
-
-        # Report stage: converting data types
-        if process_name and job_tracker:
-            _report_stage(process_name, "Converting data types", job_tracker)
-
-        # Data type conversion
-        with ContextProfiler(profiler, "DataTypeConversion"):
-            final_cutouts_batch = convert_data_type(processed_cutouts_batch, target_dtype)
+        # Normalization and data type conversion
+        with ContextProfiler(profiler, Stage.NORMALISATION):
+            final_cutouts_batch = apply_normalisation(cutouts_batch, config)
     else:
         final_cutouts_batch = combine_unresized_cutouts_to_list(all_source_cutouts)
 
@@ -397,7 +479,7 @@ def _process_sources_batch_vectorized_with_fits_set(
         _report_stage(process_name, "Finalizing metadata", job_tracker)
 
     # Metadata postprocessing - create list of metadata dicts and WCS dicts
-    with ContextProfiler(profiler, "MetaDataPostprocessing"):
+    with ContextProfiler(profiler, Stage.METADATA_POSTPROCESSING):
         # Build lookup dict once for O(1) access instead of O(n) per source
         source_lookup = {s["SourceID"]: s for s in sources_batch}
         batch_timestamp = time.time()
@@ -406,12 +488,27 @@ def _process_sources_batch_vectorized_with_fits_set(
         # Pre-compute sample pixel scale for diameter_arcsec conversion
         first_sample_key = next(iter(pixel_scales_dict), None)
         first_pixel_scale = pixel_scales_dict.get(first_sample_key) if first_sample_key else None
+        if first_pixel_scale is None:
+            # No WCS for this batch → pixel_scale_arcsec_per_pixel is undefined for
+            # every source. One notice per batch, not per source, since batches can
+            # carry >1M sources. (Any arcsec→pixel sizing affected by the missing
+            # scale is reported separately, with an exact count, below.)
+            logger.warning(
+                f"No pixel scale available for this batch of {n_sources} sources — "
+                "PIXSCALE metadata (pixel_scale_arcsec_per_pixel) will be undefined."
+            )
 
         # Vectorized extraction of source data
         source_data_list = [source_lookup.get(sid, {}) for sid in source_ids]
 
-        # Vectorized computation of original_cutout_size if needed
-        if compute_full_wcs:
+        # Vectorized computation of original_cutout_size is only needed when a
+        # downstream consumer will actually use it:
+        # - compute_full_wcs (FITS output reconstructs per-source WCS from it)
+        # - resizing (pixel_scale + offset scaling use orig_size / target_resolution)
+        # The two N-length list comprehensions below dominate metadata-build time
+        # at >1M sources, so skip them for the do_only_cutout_extraction + zarr path.
+        need_original_sizes = compute_full_wcs or not config.do_only_cutout_extraction
+        if need_original_sizes:
             # Extract diameter_pixel and diameter_arcsec arrays
             diameter_pixels = np.array(
                 [
@@ -426,18 +523,39 @@ def _process_sources_batch_vectorized_with_fits_set(
                 ]
             )
 
-            # Compute sizes: prefer diameter_pixel, fallback to diameter_arcsec
-            original_sizes = np.where(
-                ~np.isnan(diameter_pixels),
-                diameter_pixels.astype(int),
-                np.where(
-                    (~np.isnan(diameter_arcsecs)) & (first_pixel_scale is not None),
-                    np.round(diameter_arcsecs / first_pixel_scale).astype(int),
-                    0,  # Will be converted to None below
-                ),
+            # Prefer diameter_pixel, fall back to diameter_arcsec; fails hard on a
+            # degenerate pixel scale. See _compute_original_sizes for the masking
+            # rationale (avoids the spurious "invalid value encountered in cast").
+            size_result = _compute_original_sizes(
+                diameter_pixels, diameter_arcsecs, first_pixel_scale
             )
+            original_sizes = size_result.sizes
+
+            # Report sources that ended up without a usable original_cutout_size once
+            # per cause per batch (never per source — batches can carry >1M sources).
+            # The cutouts themselves are still extracted, clamped to >= 1 px upstream.
+            if size_result.n_no_scale:
+                logger.warning(
+                    f"{size_result.n_no_scale}/{n_sources} sources are sized by "
+                    "diameter_arcsec but no pixel scale is available for this batch; "
+                    "their original_cutout_size is undefined (cutouts still extracted)."
+                )
+            if size_result.n_subpixel:
+                logger.warning(
+                    f"{size_result.n_subpixel}/{n_sources} sources have diameter_arcsec below "
+                    f"one pixel ({first_pixel_scale:.4g} arcsec/px) and were extracted "
+                    "at the 1 px minimum; their original_cutout_size is undefined."
+                )
         else:
             original_sizes = np.zeros(n_sources, dtype=int)
+
+        # Resolve the scalar target resolution used for resize_factor math. Config
+        # can carry either an int or a (H, W) tuple; assume square output for the
+        # purposes of offset/pixel-scale scaling.
+        if isinstance(config.target_resolution, (tuple, list)):
+            target_resolution_scalar = int(config.target_resolution[0])
+        else:
+            target_resolution_scalar = int(config.target_resolution)
 
         # Build metadata list and WCS list
         metadata_list = []
@@ -450,22 +568,46 @@ def _process_sources_batch_vectorized_with_fits_set(
             source_offsets = all_source_offsets.get(source_id, {"x": 0.0, "y": 0.0})
             extraction_offset_x = source_offsets.get("x", 0.0)
             extraction_offset_y = source_offsets.get("y", 0.0)
+            # Integer extraction origin/size (parent-tile pixels, pre-resize), computed
+            # vectorised at extraction time. Passed through so the FITS writer can build
+            # the cutout WCS without recomputing world_to_pixel and the window bounds.
+            extraction_origin_x = source_offsets.get("origin_x")
+            extraction_origin_y = source_offsets.get("origin_y")
+            extraction_size = source_offsets.get("extraction_size")
 
-            # Scale pixel offsets by resize factor if resizing was applied
-            # The rescaled offset is in the final output image pixel coordinates
-            # (larger final image = proportionally larger offset in final pixel coords)
-            if not config.do_only_cutout_extraction and orig_size is not None and orig_size > 0:
-                resize_factor = config.target_resolution / orig_size
+            # When resizing is applied, scale offsets and pixel scale by the same
+            # resize_factor so both stay consistent with the final output coords.
+            # `first_pixel_scale` is arcsec/pixel in the original FITS tile; the
+            # output pixel scale shrinks by 1/resize_factor (more output pixels →
+            # smaller arcsec per pixel).
+            resizing_applied = (
+                not config.do_only_cutout_extraction and orig_size is not None and orig_size > 0
+            )
+            if resizing_applied:
+                resize_factor = target_resolution_scalar / orig_size
                 rescaled_offset_x = extraction_offset_x * resize_factor
                 rescaled_offset_y = extraction_offset_y * resize_factor
+                pixel_scale_arcsec_per_pixel = (
+                    float(first_pixel_scale / resize_factor)
+                    if first_pixel_scale is not None
+                    else None
+                )
                 logger.debug(
                     f"{source_id}: Offset scaling - extraction:({extraction_offset_x:.4f}, {extraction_offset_y:.4f}) "
                     f"-> rescaled:({rescaled_offset_x:.4f}, {rescaled_offset_y:.4f}) [factor={resize_factor:.2f}]"
                 )
             else:
-                # No resizing: offsets remain in extraction coordinates
+                # No resizing: offsets and pixel scale stay in original coordinates
                 rescaled_offset_x = extraction_offset_x
                 rescaled_offset_y = extraction_offset_y
+                pixel_scale_arcsec_per_pixel = (
+                    float(first_pixel_scale) if first_pixel_scale is not None else None
+                )
+
+            # Tile identifier(s): basename(s) of the FITS file(s) this source came from.
+            # Multi-channel sources concatenate all tile basenames separated by a comma
+            # so downstream users can recover the exact tile set.
+            tile = _extract_tile_basename(source_data.get("fits_file_paths"))
 
             metadata_list.append(
                 {
@@ -475,9 +617,14 @@ def _process_sources_batch_vectorized_with_fits_set(
                     "diameter_arcsec": source_data.get("diameter_arcsec"),
                     "diameter_pixel": source_data.get("diameter_pixel"),
                     "original_cutout_size": orig_size,
+                    "pixel_scale_arcsec_per_pixel": pixel_scale_arcsec_per_pixel,
+                    "tile": tile,
                     "processing_timestamp": batch_timestamp,
                     "rescaled_offset_x": rescaled_offset_x,
                     "rescaled_offset_y": rescaled_offset_y,
+                    "extraction_origin_x": extraction_origin_x,
+                    "extraction_origin_y": extraction_origin_y,
+                    "extraction_size": extraction_size,
                 }
             )
             wcs_list.append(all_source_wcs.get(source_id, {}))

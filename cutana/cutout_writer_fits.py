@@ -16,26 +16,47 @@ This module provides static functions for:
 """
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 from dotmap import DotMap
 from loguru import logger
+
+from cutana.constants import (
+    UNIT_APPROX_PREFIX,
+    UNIT_JANSKY,
+    UNIT_NORMALISED,
+    UNIT_ORIGINAL,
+    UNIT_USER_CONVERSION,
+)
+from cutana.normalisation_parameters import preserves_physical_scale
 
 # Cache for WCS header conversions - key is id(wcs_object)
 _wcs_header_cache: Dict[int, Tuple[fits.Header, Any]] = {}
 
 
 def _get_cached_wcs_info(wcs: WCS) -> Tuple[fits.Header, Any]:
-    """Get cached WCS header and pixel scale matrix, computing if not cached."""
+    """Get cached WCS header and pixel scale matrix, computing if not cached.
+
+    ``pixel_scale_matrix`` can raise for degenerate/malformed WCS (e.g. missing
+    CD/CDELT keywords). We fall back to ``None`` so downstream code can use the
+    simple-scaling branch, but we surface the root cause at warning level rather
+    than swallowing it silently.
+    """
     wcs_id = id(wcs)
     if wcs_id not in _wcs_header_cache:
         header = wcs.to_header()
         try:
             pixel_scale_matrix = wcs.pixel_scale_matrix
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"Could not compute pixel_scale_matrix for WCS (id={wcs_id}), "
+                f"falling back to simple scaling: {e}"
+            )
             pixel_scale_matrix = None
         _wcs_header_cache[wcs_id] = (header, pixel_scale_matrix)
     return _wcs_header_cache[wcs_id]
@@ -104,36 +125,87 @@ def generate_fits_filename(
         return f"{source_id}_cutout.fits"
 
 
+def _rescale_wcs_pixel_scale(header: fits.Header, pixel_scale_matrix: Any, resize: float) -> None:
+    """Rescale a WCS header's pixel scale (CD or PC+CDELT) in place for a resize.
+
+    A resize by ``resize = final_size / extraction_size`` shrinks the per-pixel sky
+    step by ``1 / resize`` (more output pixels -> smaller step). The projection
+    orientation (CRVAL, CTYPE, and the CD/PC direction) is untouched.
+
+    Args:
+        header: WCS header to modify in place.
+        pixel_scale_matrix: Parent ``pixel_scale_matrix`` (or None if unavailable).
+        resize: Ratio final_size / extraction_size.
+    """
+    if "CD1_1" in header and "CD2_2" in header:
+        # CD already folds scale into the matrix; divide every present element.
+        for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2"):
+            if key in header:
+                header[key] = header[key] / resize
+    elif "CDELT1" in header and "CDELT2" in header:
+        if pixel_scale_matrix is not None and "PC1_1" in header and "PC2_2" in header:
+            # PC carries the orientation; put the rescaled per-pixel step into CDELT.
+            header["CDELT1"] = (pixel_scale_matrix[0, 0] / resize) / header.get("PC1_1", 1.0)
+            header["CDELT2"] = (pixel_scale_matrix[1, 1] / resize) / header.get("PC2_2", 1.0)
+        else:
+            header["CDELT1"] = header["CDELT1"] / resize
+            header["CDELT2"] = header["CDELT2"] / resize
+
+
 def create_wcs_header(
     cutout_shape: tuple,
     original_wcs: Optional[WCS] = None,
-    ra_center: Optional[float] = None,
-    dec_center: Optional[float] = None,
+    ra_source: Optional[float] = None,
+    dec_source: Optional[float] = None,
     pixel_scale: Optional[float] = None,
     resize_factor: Optional[float] = None,
     rescaled_offset_x: Optional[float] = None,
     rescaled_offset_y: Optional[float] = None,
+    extraction_origin_x: Optional[int] = None,
+    extraction_origin_y: Optional[int] = None,
+    extraction_size: Optional[int] = None,
 ) -> fits.Header:
     """
-    Create WCS header for cutout.
+    Create a WCS header for a cutout.
+
+    When the parent-tile WCS is available, the cutout WCS reproduces the parent
+    sky mapping exactly (the ``astropy.nddata.Cutout2D`` construction): CRVAL,
+    CTYPE and the CD/PC orientation are inherited unchanged, and only CRPIX is
+    shifted to the cutout's integer extraction origin (CD rescaled when the
+    cutout was resized).
+
+    It deliberately does NOT re-tangent the projection at the source position.
+    Setting CRVAL to the source RA/Dec and CRPIX to the geometric centre while
+    keeping the tile's CD matrix rotates the cutout frame by the meridian
+    convergence between the tile centre and the source, producing a WCS error
+    that GROWS with distance from the cutout centre (order ~1" at a few-arcmin
+    FOV for sources far from the tile centre).
+
+    The extraction origin and size are threaded in from ``cutout_extraction`` (via
+    metadata) rather than recomputed here, so the (already-vectorised) world_to_pixel
+    and window/clip/pad geometry is not duplicated.
 
     Args:
-        cutout_shape: Shape of the cutout (height, width)
-        original_wcs: Original WCS from parent image
-        ra_center: RA of cutout center in degrees
-        dec_center: Dec of cutout center in degrees
-        pixel_scale: Pixel scale in arcsec/pixel
-        resize_factor: Factor by which the cutout was resized (new_size/original_size)
-            Used ONLY for adjusting pixel scale in WCS, NOT for offset scaling.
-        rescaled_offset_x: Sub-pixel X offset in FINAL image coordinates (positive = target toward right).
-            This offset is ALREADY scaled by resize_factor and should be used as-is.
-        rescaled_offset_y: Sub-pixel Y offset in FINAL image coordinates (positive = target toward top).
-            This offset is ALREADY scaled by resize_factor and should be used as-is.
+        cutout_shape: Shape of the final cutout (height, width).
+        original_wcs: WCS of the parent tile.
+        ra_source: Source RA in degrees. Used as CRVAL only in the no-parent-WCS fallback.
+        dec_source: Source Dec in degrees (see ``ra_source``).
+        pixel_scale: Pixel scale in arcsec/pixel (fallback branch only).
+        resize_factor: final_size / requested_size (fallback branch only).
+        rescaled_offset_x: Sub-pixel X offset in final coords (fallback branch only).
+        rescaled_offset_y: Sub-pixel Y offset in final coords (fallback branch only).
+        extraction_origin_x: 0-based integer parent-pixel X origin of cutout pixel 0,
+            computed at extraction time (clip/centre-pad corrected). Required for the
+            parent-WCS branch.
+        extraction_origin_y: As ``extraction_origin_x`` for the Y axis.
+        extraction_size: Pre-resize extraction window size in parent pixels
+            (``int(requested * padding_factor)``). Required for the parent-WCS branch;
+            the resize ratio is ``final_size / extraction_size``.
 
     Returns:
-        FITS header with WCS information
+        FITS header with WCS information.
     """
-    # Default offsets to 0 if not provided
+    # Default offsets to 0 if not provided (fallback branch only).
     if rescaled_offset_x is None:
         rescaled_offset_x = 0.0
     if rescaled_offset_y is None:
@@ -145,27 +217,53 @@ def create_wcs_header(
             cached_header, cached_pixel_scale_matrix = _get_cached_wcs_info(original_wcs)
             header = cached_header.copy()
 
-            # Update reference pixel to center of cutout, adjusted by rescaled offset
-            # CRPIX follows FITS convention: 1-based indexing where pixel (1,1) is bottom-left
-            # For an N-pixel image, the geometric center is at (N/2 + 0.5) in FITS 1-based coords
-            # The rescaled_offset is in 0-based pixel coordinates, so we add it after converting center to 1-based
-            height, width = cutout_shape
-            fits_center_x = width / 2.0 + 0.5  # Convert 0-based center to FITS 1-based
-            fits_center_y = height / 2.0 + 0.5
-            header["CRPIX1"] = fits_center_x + rescaled_offset_x
-            header["CRPIX2"] = fits_center_y + rescaled_offset_y
+            final_size = cutout_shape[0]  # cutouts are square
+
+            if (
+                extraction_origin_x is None
+                or extraction_origin_y is None
+                or extraction_size is None
+            ):
+                # These are threaded from cutout_extraction via metadata; their absence
+                # is a broken invariant, not a recoverable per-source condition.
+                raise ValueError(
+                    "extraction_origin_x/y and extraction_size are required to build a "
+                    "cutout WCS from a parent tile WCS (threaded from cutout_extraction)."
+                )
+
+            if getattr(original_wcs, "sip", None) is not None:
+                # SIP distortion is referenced to CRPIX and is not propagated/rescaled
+                # here, so a distorted tile would yield an inaccurate cutout WCS. Euclid
+                # MER mosaics are undistorted TAN, so this does not affect them; warn
+                # loudly rather than emit a silently-wrong header for distorted tiles.
+                # Full SIP propagation is tracked in issue #238.
+                logger.warning(
+                    "Parent tile WCS carries SIP distortion, which the cutout WCS does "
+                    "not propagate; the cutout WCS may be inaccurate for distorted tiles "
+                    "(full SIP support tracked in issue #238)."
+                )
+
+            resize = final_size / extraction_size
+            crpix1_parent = float(cached_header["CRPIX1"])
+            crpix2_parent = float(cached_header["CRPIX2"])
+            # Pre-resize: CRPIX_cut = CRPIX_parent - origin. A resize by ``resize`` maps
+            # this to 0.5 + resize*(CRPIX - origin - 0.5) (cv2.resize half-pixel centres).
+            header["CRPIX1"] = 0.5 + resize * (crpix1_parent - extraction_origin_x - 0.5)
+            header["CRPIX2"] = 0.5 + resize * (crpix2_parent - extraction_origin_y - 0.5)
             logger.debug(
-                f"WCS CRPIX: FITS_center=({fits_center_x:.2f}, {fits_center_y:.2f}) + "
-                f"offset=({rescaled_offset_x:.4f}, {rescaled_offset_y:.4f}) = "
+                f"WCS CRPIX (origin-anchored): ext={extraction_size} resize={resize:.4f} "
+                f"origin=({extraction_origin_x}, {extraction_origin_y}) -> "
                 f"({header['CRPIX1']:.4f}, {header['CRPIX2']:.4f})"
             )
 
-            # Update reference coordinates if provided
-            if ra_center is not None and dec_center is not None:
-                header["CRVAL1"] = ra_center
-                header["CRVAL2"] = dec_center
+            # CRVAL, CTYPE and the CD/PC orientation are inherited from the parent
+            # unchanged (do NOT overwrite CRVAL). Only rescale the pixel scale for a resize.
+            if resize != 1.0:
+                _rescale_wcs_pixel_scale(header, cached_pixel_scale_matrix, resize)
 
-        elif ra_center is not None and dec_center is not None:
+            return header
+
+        elif ra_source is not None and dec_source is not None:
             # Create minimal WCS header
             header = fits.Header()
             height, width = cutout_shape
@@ -178,8 +276,8 @@ def create_wcs_header(
             fits_center_y = height / 2.0 + 0.5
             header["CRPIX1"] = fits_center_x + rescaled_offset_x
             header["CRPIX2"] = fits_center_y + rescaled_offset_y
-            header["CRVAL1"] = ra_center
-            header["CRVAL2"] = dec_center
+            header["CRVAL1"] = ra_source
+            header["CRVAL2"] = dec_source
             logger.debug(
                 f"Minimal WCS CRPIX: FITS_center=({fits_center_x:.2f}, {fits_center_y:.2f}) + "
                 f"offset=({rescaled_offset_x:.4f}, {rescaled_offset_y:.4f}) = "
@@ -211,56 +309,90 @@ def create_wcs_header(
             # No WCS info available
             return fits.Header()
 
-        # Apply resize factor to pixel scale when we have original_wcs
-        if original_wcs is not None and resize_factor is not None and resize_factor != 1.0:
-            # Scale pixel scale by the resize factor
-            # If image was made smaller (resize_factor < 1), pixels represent larger sky area
-            # If image was made larger (resize_factor > 1), pixels represent smaller sky area
-
-            # Use cached pixel scale matrix (computed once per WCS)
-            if cached_pixel_scale_matrix is not None:
-                original_pixel_scale_x = cached_pixel_scale_matrix[0, 0]
-                original_pixel_scale_y = cached_pixel_scale_matrix[1, 1]
-
-                # Apply resize factor to get new pixel scale
-                new_pixel_scale_x = original_pixel_scale_x / resize_factor
-                new_pixel_scale_y = original_pixel_scale_y / resize_factor
-
-                # Handle CD matrix (preferred modern format)
-                if "CD1_1" in header and "CD2_2" in header:
-                    header["CD1_1"] = header["CD1_1"] / resize_factor
-                    header["CD2_2"] = header["CD2_2"] / resize_factor
-                    if "CD1_2" in header:
-                        header["CD1_2"] = header["CD1_2"] / resize_factor
-                    if "CD2_1" in header:
-                        header["CD2_1"] = header["CD2_1"] / resize_factor
-
-                # Handle CDELT format or PC+CDELT format
-                elif "CDELT1" in header and "CDELT2" in header:
-                    # For PC+CDELT format, set CDELT to achieve desired pixel scale
-                    if "PC1_1" in header and "PC2_2" in header:
-                        pc1_1 = header.get("PC1_1", 1.0)
-                        pc2_2 = header.get("PC2_2", 1.0)
-                        header["CDELT1"] = new_pixel_scale_x / pc1_1
-                        header["CDELT2"] = new_pixel_scale_y / pc2_2
-                    else:
-                        header["CDELT1"] = new_pixel_scale_x
-                        header["CDELT2"] = new_pixel_scale_y
-            else:
-                # Fallback: simple scaling of existing header values
-                if "CD1_1" in header and "CD2_2" in header:
-                    header["CD1_1"] = header["CD1_1"] / resize_factor
-                    header["CD2_2"] = header["CD2_2"] / resize_factor
-                elif "CDELT1" in header and "CDELT2" in header:
-                    header["CDELT1"] = header["CDELT1"] / resize_factor
-                    header["CDELT2"] = header["CDELT2"] / resize_factor
-
-        return header
-
     except Exception as e:
         logger.error(f"Failed to create WCS header: {e}")
         # Return minimal header
         return fits.Header()
+
+
+@dataclass(frozen=True)
+class CutoutUnits:
+    """Pixel-unit description of a cutout, derived from the processing config.
+
+    Attributes:
+        unit: Value of the deprecated descriptive ``UNIT`` primary-header keyword.
+        bunit: Value of the standard ``BUNIT`` image-HDU keyword, or ``None`` when
+            the unit is dimensionless or not known to the writer.
+        conserved_flux: Whether flux-conserving resizing was used.
+        flux_approximate: Whether the values only approximate the stated unit.
+            Written to ``FLUXAPPX`` only when ``bunit`` is set, since it qualifies
+            ``bunit``; it is always False for dimensionless (normalised) pixels,
+            where approximation to a unit is meaningless.
+    """
+
+    unit: str
+    bunit: Optional[str]
+    conserved_flux: bool
+    flux_approximate: bool
+
+
+def resolve_cutout_units(config: DotMap) -> CutoutUnits:
+    """Derive the pixel-unit description of a cutout from the processing config.
+
+    The unit depends on normalisation as well as on flux handling: normalisation
+    stretches pixels into the ``data_type`` range and therefore destroys the
+    physical scale, so a normalised cutout is dimensionless no matter what the
+    flux-conversion settings say. ``do_only_cutout_extraction`` bypasses
+    normalisation entirely; otherwise the scale only survives the cases
+    ``preserves_physical_scale`` allows.
+
+    Args:
+        config: Processing configuration.
+
+    Returns:
+        The resolved :class:`CutoutUnits`.
+
+    Raises:
+        AttributeError: If a required configuration key is missing (DotMap
+            attribute access on a non-dynamic config).
+    """
+    # do_only_cutout_extraction bypasses resizing and normalisation alike, so it
+    # conserves flux trivially and keeps the input dtype.
+    raw_cutout = config.do_only_cutout_extraction
+    conserved_flux = config.flux_conserved_resizing or raw_cutout
+
+    if not raw_cutout and not preserves_physical_scale(config):
+        # Dimensionless: no BUNIT, and "approximate" does not apply to a unit that
+        # no longer exists.
+        return CutoutUnits(UNIT_NORMALISED, None, conserved_flux, False)
+
+    flux_approximate = not conserved_flux
+    if not config.apply_flux_conversion:
+        # Pixels keep the parent tile's unit, which the writer cannot name.
+        return CutoutUnits(
+            _approx(UNIT_ORIGINAL, flux_approximate), None, conserved_flux, flux_approximate
+        )
+
+    if config.user_flux_conversion_function is not None:
+        # A user hook replaces the AB-zeropoint maths entirely. The pixels were
+        # converted, just not by cutana and not necessarily to Jy, so they are
+        # neither "original" nor nameable here — only the user knows the unit.
+        return CutoutUnits(
+            _approx(UNIT_USER_CONVERSION, flux_approximate), None, conserved_flux, flux_approximate
+        )
+
+    # Only Jy is a parseable FITS unit string, so it is the only value written to
+    # BUNIT; every other case signals "unknown" by omitting the keyword. BUNIT is
+    # still written when the resize did not conserve flux: the unit is Jy either
+    # way, and FLUXAPPX carries the caveat that the values only approximate it.
+    return CutoutUnits(
+        _approx(UNIT_JANSKY, flux_approximate), UNIT_JANSKY, conserved_flux, flux_approximate
+    )
+
+
+def _approx(unit: str, flux_approximate: bool) -> str:
+    """Prefix a unit with ``approx`` when the resize did not conserve flux."""
+    return f"{UNIT_APPROX_PREFIX}{unit}" if flux_approximate else unit
 
 
 def write_single_fits_cutout(
@@ -282,7 +414,20 @@ def write_single_fits_cutout(
 
     Returns:
         True if successful, False otherwise
+
+    Raises:
+        KeyError: If ``cutout_data`` is missing the mandatory unit metadata.
     """
+    # Read the unit metadata outside the try below: a caller that forgets it has a
+    # bug, and must not have it downgraded to a logged line and a dropped file the
+    # way a genuine per-file write failure is.
+    units = CutoutUnits(
+        unit=cutout_data["unit"],
+        bunit=cutout_data["bunit"],
+        conserved_flux=cutout_data["conserved_flux"],
+        flux_approximate=cutout_data["flux_approximate"],
+    )
+
     try:
         # Extract data
         source_id = cutout_data["source_id"]
@@ -302,19 +447,30 @@ def write_single_fits_cutout(
         # Create primary HDU
         primary_hdu = fits.PrimaryHDU()
 
-        # Add metadata to primary header using batch update (more efficient)
-        primary_hdu.header.update(
-            {
-                "SOURCE": source_id,
-                "RA": metadata.get("ra", 0.0),
-                "DEC": metadata.get("dec", 0.0),
-                "SIZEARC": metadata.get("diameter_arcsec", 0.0),
-                "SIZEPIX": metadata.get("diameter_pixel", 0),
-                "PROCTIME": metadata.get("processing_timestamp", time.time()),
-                "STRETCH": metadata.get("stretch", "linear"),
-                "DTYPE": metadata.get("data_type", "float32"),
-            }
-        )
+        # Add metadata to primary header using batch update (more efficient).
+        # PIXSCALE and TILE are always set (even when None) so consumers can rely
+        # on a stable schema and use header[key] without KeyError handling. None
+        # is written as a FITS UNDEFINED card and round-trips back to None.
+        primary_header_updates = {
+            "SOURCE": source_id,
+            "RA": metadata.get("ra", 0.0),
+            "DEC": metadata.get("dec", 0.0),
+            "SIZEARC": metadata.get("diameter_arcsec", 0.0),
+            "SIZEPIX": metadata.get("diameter_pixel", 0),
+            "PROCTIME": metadata.get("processing_timestamp", time.time()),
+            "STRETCH": metadata.get("stretch", "linear"),
+            "DTYPE": metadata.get("data_type", "float32"),
+            "PIXSCALE": metadata.get("pixel_scale_arcsec_per_pixel"),
+            "TILE": metadata.get("tile"),
+            # Legacy descriptive unit, kept for 0.3.2-era readers. New consumers
+            # should read BUNIT on the image HDUs instead.
+            "UNIT": (units.unit, "Deprecated, see BUNIT on image HDUs"),
+            "CONSVFLX": (
+                units.conserved_flux,
+                "F: Flux not conserved in resizing, T: conserved",
+            ),
+        }
+        primary_hdu.header.update(primary_header_updates)
 
         # Create HDU list
         hdu_list = [primary_hdu]
@@ -330,6 +486,18 @@ def write_single_fits_cutout(
                 image_hdu.header["COMPRESS"] = compression
             else:
                 image_hdu = fits.ImageHDU(data=cutout, name=channel)
+
+            # BUNIT belongs on the HDU carrying the pixels, and must be a parseable
+            # unit string — so it is written only when the unit is actually known.
+            # Dimensionless (normalised) and unknown (original tile) units are
+            # signalled by its absence rather than by a placeholder value. FLUXAPPX
+            # qualifies BUNIT, so it is meaningless without it.
+            if units.bunit is not None:
+                image_hdu.header["BUNIT"] = (units.bunit, "Physical unit of the array values")
+                image_hdu.header["FLUXAPPX"] = (
+                    units.flux_approximate,
+                    "T: values only approximate BUNIT",
+                )
 
             # Add WCS information if available and requested
             if preserve_wcs:
@@ -352,6 +520,13 @@ def write_single_fits_cutout(
                         f"Retrieved rescaled offsets from metadata: ({rescaled_offset_x:.4f}, {rescaled_offset_y:.4f})"
                     )
 
+                    # Integer extraction origin/size threaded from cutout_extraction; the
+                    # parent-WCS branch uses these to anchor CRPIX without recomputing the
+                    # window geometry.
+                    extraction_origin_x = metadata.get("extraction_origin_x")
+                    extraction_origin_y = metadata.get("extraction_origin_y")
+                    extraction_size = metadata.get("extraction_size")
+
                     if channel in wcs_info:
                         logger.debug(
                             f"Creating WCS header for channel {channel} using original WCS"
@@ -359,11 +534,14 @@ def write_single_fits_cutout(
                         wcs_header = create_wcs_header(
                             cutout.shape,
                             original_wcs=wcs_info[channel],
-                            ra_center=metadata.get("ra"),
-                            dec_center=metadata.get("dec"),
+                            ra_source=metadata.get("ra"),
+                            dec_source=metadata.get("dec"),
                             resize_factor=resize_factor,
                             rescaled_offset_x=rescaled_offset_x,
                             rescaled_offset_y=rescaled_offset_y,
+                            extraction_origin_x=extraction_origin_x,
+                            extraction_origin_y=extraction_origin_y,
+                            extraction_size=extraction_size,
                         )
                     else:
                         # Fallback: create minimal WCS using source coordinates
@@ -373,11 +551,14 @@ def write_single_fits_cutout(
                         wcs_header = create_wcs_header(
                             cutout.shape,
                             original_wcs=None,
-                            ra_center=metadata.get("ra"),
-                            dec_center=metadata.get("dec"),
+                            ra_source=metadata.get("ra"),
+                            dec_source=metadata.get("dec"),
                             resize_factor=resize_factor,
                             rescaled_offset_x=rescaled_offset_x,
                             rescaled_offset_y=rescaled_offset_y,
+                            extraction_origin_x=extraction_origin_x,
+                            extraction_origin_y=extraction_origin_y,
+                            extraction_size=extraction_size,
                         )
 
                     if wcs_header:
@@ -432,7 +613,6 @@ def write_fits_batch(
         compression: Optional compression method
         create_subdirs: Whether to create subdirectories for organization
         overwrite: Whether to overwrite existing files
-        multi_extension: Whether to write as single multi-extension file
         modifier: None
 
     Returns:
@@ -442,11 +622,40 @@ def write_fits_batch(
 
     if file_naming_template is None:
         file_naming_template = "{modifier}{source_id}_{ra:.6f}_{dec:.6f}_cutout.fits"
+
+    # Raw extraction keeps the input labels; a combined output has no bands left to name
+    # and uses channel_1..N. Losing the labels would silently write generic names over
+    # named inputs -- the mislabelling this path exists to avoid, and invisible in the
+    # output. Checked here rather than in the write loop below, whose broad handler would
+    # turn it into a logged empty result instead of a failure.
+    if config.do_only_cutout_extraction:
+        for batch_result in batch_data:
+            # Direct access: a batch result without these keys is a broken contract, not
+            # a shape to tolerate. Defaulting `channel_names` to [] in particular turned a
+            # missing key into a count mismatch, which reads as a channel-configuration
+            # problem and sends the reader to the wrong place entirely.
+            cutouts = batch_result["cutouts"]
+            if len(cutouts) == 0:
+                continue
+            # Unresized extraction hands back a list of per-source (H, W, C) arrays;
+            # a resized batch is one (N, H, W, C) array. Both put C last on a source.
+            n_channels = np.shape(cutouts[0])[-1]
+            names = batch_result["channel_names"]
+            if len(names) != n_channels:
+                raise ValueError(
+                    f"Extraction-only output needs one channel name per tensor channel: "
+                    f"got {len(names)} names {names} for {n_channels} channels"
+                )
+
     try:
         output_path = Path(output_directory)
         ensure_output_directory(output_path)
 
         written_files = []
+
+        # Units depend only on config, so resolve them once rather than per source
+        # (this loop runs once per catalogue row — millions in production).
+        units = resolve_cutout_units(config)
 
         # Handle the correct data structure: batch_data is a list of batch results
         # Each batch result contains "cutouts" tensor, "metadata" list, "wcs_info" list, and "channel_names"
@@ -463,11 +672,6 @@ def write_fits_batch(
             if cutouts_tensor is None or len(metadata_list) == 0:
                 logger.warning("No cutout data or metadata in batch result")
                 continue
-
-            # Pre-compute channel weight keys to avoid repeated list() calls
-            channel_weight_keys = (
-                list(config.channel_weights.keys()) if config.do_only_cutout_extraction else None
-            )
 
             # Process each source in the batch
             for source_idx, metadata in enumerate(metadata_list):
@@ -490,10 +694,10 @@ def write_fits_batch(
                 source_wcs_info = {}
                 source_wcs_dict = wcs_list[source_idx] if source_idx < len(wcs_list) else {}
                 for ij in range(source_cutout.shape[2]):
-                    if channel_weight_keys:
-                        channel_name = channel_weight_keys[ij]
+                    if config.do_only_cutout_extraction:
+                        channel_name = channel_names[ij]
                     else:
-                        channel_name = f"channel_{ij+1}"  # Generic output channel names
+                        channel_name = f"channel_{ij + 1}"  # Generic output channel names
                     processed_cutouts[channel_name] = source_cutout[:, :, ij]
 
                     # Look up WCS using the original channel name from channel_names if available,
@@ -508,6 +712,10 @@ def write_fits_batch(
                     "metadata": metadata,
                     "processed_cutouts": processed_cutouts,
                     "wcs_info": source_wcs_info,  # Use properly mapped WCS info
+                    "unit": units.unit,
+                    "bunit": units.bunit,
+                    "conserved_flux": units.conserved_flux,
+                    "flux_approximate": units.flux_approximate,
                 }
 
                 # Determine output directory for this source

@@ -14,23 +14,26 @@ Tests cover:
 - Workflow resumption capability
 """
 
+import subprocess
 import time
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
 import pytest
+from loguru import logger
 
+from cutana import get_default_config
+from cutana.job_tracker import JobTracker
 from cutana.orchestrator import Orchestrator
 
 
 class TestOrchestrator:
     """Test suite for Orchestrator class."""
 
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def mock_catalogue_data(self):
         """Create mock catalogue data for testing using real test files."""
-        from pathlib import Path
-
         test_data_dir = Path(__file__).parent.parent.parent / "test_data"
         # Find the FITS file dynamically (timestamps may change)
         fits_files = list(test_data_dir.glob("EUC_MER_BGSUB-MOSAIC-VIS_TILE102018211-*.fits"))
@@ -56,14 +59,12 @@ class TestOrchestrator:
         ]
         return pd.DataFrame(data)
 
-    @pytest.fixture
-    def config(self):
+    @pytest.fixture(scope="class")
+    def config(self, tmp_path_factory):
         """Create configuration for testing using new config system."""
-        from cutana import get_default_config
-
         config = get_default_config()
         config.source_catalogue = "/tmp/test_catalogue.csv"  # Required field
-        config.output_dir = "/tmp/cutouts"
+        config.output_dir = str(tmp_path_factory.mktemp("orchestrator_output"))
         config.output_format = "zarr"
         config.target_resolution = 256
         config.data_type = "float32"
@@ -77,35 +78,46 @@ class TestOrchestrator:
         config.max_workers = 4
         return config
 
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def orchestrator(self, config):
-        """Create Orchestrator instance for testing with proper cleanup."""
-        # Use a unique temp directory for each orchestrator to prevent conflicts
-        import tempfile
+        """Create Orchestrator instance for testing (class-scoped to reduce setup overhead)."""
+        orchestrator = Orchestrator(config)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Override output_dir to use isolated temp directory
-            config.output_dir = temp_dir
-            orchestrator = Orchestrator(config)
+        yield orchestrator
 
-            yield orchestrator
+        # Cleanup: Stop any active processes
+        try:
+            orchestrator.stop_processing()
+        except Exception:
+            pass  # Ignore errors during cleanup
 
-            # Cleanup: Stop any active processes
-            try:
-                orchestrator.stop_processing()
-            except Exception:
-                pass  # Ignore errors during cleanup
+        # Close all logging handlers to release file locks
+        try:
+            # Get list of current handler IDs and remove them
+            handler_ids = list(logger._core.handlers.keys())
+            for handler_id in handler_ids:
+                logger.remove(handler_id)
+        except Exception:
+            pass  # Ignore errors during logging cleanup
 
-            # Close all logging handlers to release file locks
-            try:
-                from loguru import logger
-
-                # Get list of current handler IDs and remove them
-                handler_ids = list(logger._core.handlers.keys())
-                for handler_id in handler_ids:
-                    logger.remove(handler_id)
-            except Exception:
-                pass  # Ignore errors during logging cleanup
+    @pytest.fixture(autouse=True)
+    def _reset_orchestrator_state(self, request):
+        """Reset mutable orchestrator state between tests to prevent cross-test contamination."""
+        yield
+        # Only reset if the orchestrator fixture was actually used by this test
+        orchestrator = request.node.funcargs.get("orchestrator")
+        if orchestrator is None:
+            return
+        orchestrator.active_processes = {}
+        orchestrator.job_tracker.active_processes = {}
+        # Restore get_process_details if it was replaced with a Mock
+        if not callable(getattr(orchestrator.job_tracker.get_process_details, "__func__", None)):
+            orchestrator.job_tracker.get_process_details = JobTracker.get_process_details.__get__(
+                orchestrator.job_tracker, JobTracker
+            )
+        # Clean up any source_to_batch_mapping set by tests
+        if hasattr(orchestrator, "source_to_batch_mapping"):
+            del orchestrator.source_to_batch_mapping
 
     def test_orchestrator_initialization(self, config):
         """Test Orchestrator initializes correctly with configuration."""
@@ -125,7 +137,6 @@ class TestOrchestrator:
             patch("psutil.cpu_count", return_value=8),
             patch("psutil.virtual_memory") as mock_memory,
         ):
-
             mock_memory.return_value.total = 16 * 1024**3  # 16GB
             mock_memory.return_value.available = 12 * 1024**3  # 12GB available
 
@@ -225,10 +236,6 @@ class TestOrchestrator:
 
     def test_start_processing(self, tmp_path):
         """Test main processing loop with real data."""
-        from pathlib import Path
-
-        from cutana import get_default_config
-
         # Get real test data - find dynamically (timestamps may change)
         test_data_dir = Path(__file__).parent.parent.parent / "test_data"
         fits_files = list(test_data_dir.glob("EUC_MER_BGSUB-MOSAIC-VIS_TILE102018211-*.fits"))
@@ -272,6 +279,58 @@ class TestOrchestrator:
             except Exception:
                 pass  # Ignore errors during cleanup
 
+    def test_a_worker_that_exits_non_zero_fails_the_run(self, tmp_path):
+        """A failed worker must reach the run's result, not just its own log (#425).
+
+        End to end on purpose, through a real subprocess: the worker raises, exits
+        non-zero, and the orchestrator has to say so. Before this, a run whose every
+        worker died still returned ``status: completed`` with the full source count,
+        identical to a run that wrote everything.
+
+        The failure is induced with a band selection no FITS set carries, which is
+        the cheapest way to make a real worker die for a real reason.
+        """
+        test_data_dir = Path(__file__).parent.parent.parent / "test_data"
+        fits_files = list(test_data_dir.glob("EUC_MER_BGSUB-MOSAIC-VIS_TILE102018211-*.fits"))
+        if not fits_files:
+            pytest.skip("No FITS test data found")
+
+        catalogue_df = pd.DataFrame(
+            [
+                {
+                    "SourceID": "TestSource_001",
+                    "RA": 150.12,
+                    "Dec": 2.32,
+                    "diameter_pixel": 64,
+                    "fits_file_paths": str([str(fits_files[0])]),
+                }
+            ]
+        )
+        catalogue_path = tmp_path / "test_catalogue.parquet"
+        catalogue_df.to_parquet(catalogue_path, index=False)
+
+        config = get_default_config()
+        config.source_catalogue = str(catalogue_path)
+        config.output_dir = str(tmp_path / "output")
+        config.max_sources_per_process = 1000
+        config.N_batch_cutout_process = 100
+        # The tile is VIS; nothing in the catalogue carries NIR-J.
+        config.selected_extensions = [{"name": "NIR-J", "ext": "PRIMARY"}]
+        config.max_workflow_time_seconds = 600
+
+        orchestrator = Orchestrator(config)
+        try:
+            result = orchestrator.start_processing(str(catalogue_path))
+
+            assert result["status"] == "failed"
+            assert result["failed_processes"], "a dead worker has to appear in the result"
+            assert all(p["reason"].startswith("exit_code_") for p in result["failed_processes"])
+        finally:
+            try:
+                orchestrator.stop_processing()
+            except Exception:
+                pass
+
     def test_memory_constraint_handling(self, orchestrator, mock_catalogue_data):
         """Test handling of memory constraints during processing."""
         with patch.object(
@@ -296,29 +355,29 @@ class TestOrchestrator:
 
     def test_progress_reporting(self, orchestrator):
         """Test progress reporting functionality."""
-        orchestrator.job_tracker = Mock()
-        orchestrator.job_tracker.get_status.return_value = {
-            "completed_sources": 45,
-            "total_sources": 100,
-            "progress_percent": 45.0,
-            "active_processes": 3,
-            "memory_usage": 2 * 1024**3,  # 2GB
-            "errors": [],
-        }
+        original_job_tracker = orchestrator.job_tracker
+        try:
+            orchestrator.job_tracker = Mock()
+            orchestrator.job_tracker.get_status.return_value = {
+                "completed_sources": 45,
+                "total_sources": 100,
+                "progress_percent": 45.0,
+                "active_processes": 3,
+                "memory_usage": 2 * 1024**3,  # 2GB
+                "errors": [],
+            }
 
-        status = orchestrator.get_progress()
+            status = orchestrator.get_progress()
 
-        assert status["completed_sources"] == 45
-        assert status["progress_percent"] == 45.0
-        assert status["active_processes"] == 3
-        assert "memory_usage" in status
+            assert status["completed_sources"] == 45
+            assert status["progress_percent"] == 45.0
+            assert status["active_processes"] == 3
+            assert "memory_usage" in status
+        finally:
+            orchestrator.job_tracker = original_job_tracker
 
     def test_source_to_zarr_mapping_parquet_creation(self, tmp_path):
         """Test that source to zarr mapping Parquet is created correctly."""
-        from pathlib import Path
-
-        from cutana import get_default_config
-
         # Get real test data - find dynamically (timestamps may change)
         test_data_dir = Path(__file__).parent.parent.parent / "test_data"
         fits_files = list(test_data_dir.glob("EUC_MER_BGSUB-MOSAIC-VIS_TILE102018211-*.fits"))
@@ -420,8 +479,6 @@ class TestOrchestrator:
 
     def test_stop_processing_with_timeout(self, orchestrator):
         """Test stopping processes that don't terminate gracefully."""
-        import subprocess
-
         mock_proc = Mock()
         mock_proc.terminate.return_value = None
         mock_proc.wait.side_effect = subprocess.TimeoutExpired(None, 5)
@@ -558,8 +615,6 @@ class TestOrchestrator:
         parquet_path = tmp_path / "source_to_zarr_mapping.parquet"
         assert parquet_path.exists()
         # Verify Parquet contents
-        import pandas as pd
-
         df = pd.read_parquet(parquet_path)
         assert len(df) == 2
         assert set(df.columns) == {"SourceID", "zarr_file", "batch_index"}
@@ -636,3 +691,55 @@ class TestOrchestrator:
 
             # Should have made logging calls
             assert mock_logger.info.called
+
+
+class TestSkipFitsCheckIsHonoured:
+    """The checks that open FITS files must be switchable from the config.
+
+    They read over the network, which is why the knob exists: the check earns its cost
+    on a catalogue nobody has validated, not on one that has been. Both orchestrators
+    share this code path, so a hardcoded value disables the knob for every backend that
+    validates its catalogue at all.
+    """
+
+    @staticmethod
+    def _catalogue(tmp_path):
+        """Write a catalogue that is structurally valid but never opened."""
+        path = tmp_path / "catalogue.parquet"
+        pd.DataFrame(
+            [
+                {
+                    "SourceID": "source_1",
+                    "RA": 150.12,
+                    "Dec": 2.32,
+                    "diameter_pixel": 64,
+                    "fits_file_paths": str(["/nonexistent/VIS.fits"]),
+                }
+            ]
+        ).to_parquet(path, index=False)
+        return path
+
+    def _skip_fits_check_passed_to_validation(self, tmp_path, config):
+        """Run the shared init and report the flag the validator actually received."""
+        catalogue_path = self._catalogue(tmp_path)
+        config.source_catalogue = str(catalogue_path)
+        config.output_dir = str(tmp_path / "output")
+
+        orchestrator = Orchestrator(config)
+        with patch("cutana.orchestrator.validate_catalogue_sample", return_value=[]) as validate:
+            orchestrator._init_catalogue_index_and_reader(str(catalogue_path))
+
+        return validate.call_args.kwargs["skip_fits_check"]
+
+    def test_the_config_flag_reaches_the_check(self, tmp_path):
+        """Setting it had no effect: the call site passed a literal False."""
+        config = get_default_config()
+        config.skip_fits_check = True
+
+        assert self._skip_fits_check_passed_to_validation(tmp_path, config) is True
+
+    def test_the_check_is_on_by_default(self, tmp_path):
+        """Reading the flag must not quietly turn a safety check off."""
+        config = get_default_config()
+
+        assert self._skip_fits_check_passed_to_validation(tmp_path, config) is False

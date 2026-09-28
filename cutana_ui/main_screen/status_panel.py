@@ -6,6 +6,8 @@
 #   the terms contained in the file 'LICENCE.txt'.
 """Simplified status panel for the main screen."""
 
+import traceback
+
 import ipywidgets as widgets
 from loguru import logger
 
@@ -92,8 +94,12 @@ class StatusPanel(widgets.VBox):
         """Initialize the default display state."""
         num_sources = self.config.num_sources
         workers = self.config.max_workers
+        # "~" because the count can be an extrapolation from the discovery prefix rather
+        # than a row count -- the start screen labels it, and the number travels here
+        # unlabelled otherwise, where it also seeds the progress bar's total.
+        count = f"~{num_sources:,}" if self.config.num_sources_estimated else f"{num_sources:,}"
         # Ready status - make text more compact and responsive
-        self.ready_status.value = f'<p style="color: {TEXT_COLOR_LIGHT}; text-align: left; margin: 1px 0; font-size: {scale_px(12)}px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">Ready • {num_sources:,} sources • {workers} workers</p>'
+        self.ready_status.value = f'<p style="color: {TEXT_COLOR_LIGHT}; text-align: left; margin: 1px 0; font-size: {scale_px(12)}px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">Ready • {count} sources • {workers} workers</p>'
 
         # Default stats - use new signature with worker allocation info
         self._update_stats_display(
@@ -178,8 +184,6 @@ class StatusPanel(widgets.VBox):
 
         except Exception as e:
             logger.error(f"StatusPanel: Error in receive_status_UI_update: {e}")
-            import traceback
-
             logger.error(f"StatusPanel: Full traceback: {traceback.format_exc()}")
 
     def _handle_progress_update(self, status):
@@ -243,8 +247,6 @@ class StatusPanel(widgets.VBox):
 
         except Exception as e:
             logger.error(f"StatusPanel: Error handling progress update: {e}")
-            import traceback
-
             logger.error(f"StatusPanel: Full traceback: {traceback.format_exc()}")
 
     def _handle_completion(self):

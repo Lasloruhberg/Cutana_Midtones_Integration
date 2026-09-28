@@ -37,7 +37,13 @@ _.preview_cutouts  # noqa
 _.original_layout  # noqa
 _.channel_matrix  # noqa
 _.max_width  # noqa
+_.min_width  # noqa
+_.padding  # noqa
 _.margin  # noqa
+_.background  # noqa
+_.border  # noqa
+_.border_radius  # noqa
+_.overflow  # noqa
 _.crop_enable_label  # noqa
 _.disabled  # noqa
 _.default_filename  # noqa
@@ -53,11 +59,33 @@ ESA_RED  # noqa
 # PreviewCache class attribute - accessed dynamically within class methods
 _.config_cache  # noqa
 
-# StreamingOrchestrator public API - documented in README, used in examples/async_streaming.py
+# StreamingOrchestrator instance attributes - stored for introspection, not read internally
+_._min_workers  # noqa - set by init_streaming, exposed for external inspection
+
+# StreamingOrchestrator public API - documented in README, used in examples/
 init_streaming  # noqa - public API for batch streaming workflow
 next_batch  # noqa - public API for getting next batch of cutouts
 get_batch_count  # noqa - public API for getting total batch count
-get_batch  # noqa - public API for random access to batches
+get_worker_info  # noqa - public API for per-worker batch/timing detail, used in benchmark scripts
+get_delivery_report  # noqa - public API for inspecting per-worker cutout shortfalls
+
+# Eager catalogue API documented in README and exercised by catalogue preprocessor tests.
+# Discovery uses bounded sampling, but external callers can still request a full DataFrame.
+load_and_validate_catalogue  # noqa
+
+# WorkerInfo schema fields (cutana/profiling_types.py) - deliberately defined up front so
+# consumers of get_worker_info() know the full per-worker schema (issue #354/#312), even
+# the fields read only by external benchmark scripts rather than inside cutana/.
+_worker_info_schema = None  # noqa
+_worker_info_schema.pool_slot  # noqa - exposed via get_worker_info() for external consumers
+_worker_info_schema.sources_per_fits_set  # noqa - exposed via get_worker_info()
+_worker_info_schema.batch_index  # noqa - exposed via get_worker_info() for external consumers
+_worker_info_schema.end_time  # noqa - set on completion, read by benchmark scripts (not in cutana/)
+_worker_info_schema.performance  # noqa - per-stage stats, read by benchmark scripts (not in cutana/)
+
+# Canonical stage list (cutana/profiling_types.py) - the benchmark scripts (outside
+# cutana/, so invisible to vulture here) build their STAGE_ORDER from it.
+COMPUTE_STAGES  # noqa - consumed by benchmarking/profile_cutana.py and profile_plots.py
 
 # SystemMonitor utility methods - public API for resource monitoring
 check_memory_constraints  # noqa - utility for checking available memory

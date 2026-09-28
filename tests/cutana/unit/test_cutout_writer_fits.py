@@ -19,19 +19,150 @@ Tests cover:
 from pathlib import Path
 from unittest.mock import patch
 
+import fitsbolt
 import numpy as np
 import pytest
+from astropy import units as u
 from astropy.io import fits
 from astropy.wcs import WCS
 from dotmap import DotMap
 
+from cutana import cutout_writer_fits
+from cutana.cutout_extraction import extract_cutouts_vectorized_from_extension
 from cutana.cutout_writer_fits import (
+    CutoutUnits,
     create_wcs_header,
     ensure_output_directory,
     generate_fits_filename,
+    resolve_cutout_units,
     write_fits_batch,
     write_single_fits_cutout,
 )
+
+# write_single_fits_cutout reads these directly, so every cutout_data dict needs
+# them even when the test targets an unrelated failure path.
+_UNIT_KEYS = {
+    "unit": "approx Jy",
+    "bunit": "Jy",
+    "conserved_flux": False,
+    "flux_approximate": True,
+}
+
+
+def _units_config(**overrides):
+    """Build a unit-resolution config that raises on missing keys, like production.
+
+    ``get_default_config`` returns ``DotMap(_dynamic=False)``; a dynamic DotMap
+    would auto-vivify a missing key to an empty DotMap and silently pass.
+    """
+    base = {
+        "do_only_cutout_extraction": False,
+        "normalisation_method": "linear",
+        "data_type": "float32",
+        "flux_conserved_resizing": False,
+        "apply_flux_conversion": True,
+        "user_flux_conversion_function": None,
+        "external_fitsbolt_cfg": None,
+    }
+    return DotMap({**base, **overrides}, _dynamic=False)
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "expected"),
+    [
+        # Normalisation destroys the physical scale regardless of flux settings.
+        ({}, CutoutUnits("normalised", None, False, False)),
+        ({"flux_conserved_resizing": True}, CutoutUnits("normalised", None, True, False)),
+        # CONVERSION_ONLY with a float32 output dtype is a genuine no-op.
+        ({"normalisation_method": "none"}, CutoutUnits("approx Jy", "Jy", False, True)),
+        (
+            {"normalisation_method": "none", "flux_conserved_resizing": True},
+            CutoutUnits("Jy", "Jy", True, False),
+        ),
+        (
+            {"normalisation_method": "none", "apply_flux_conversion": False},
+            CutoutUnits("approx OriginalUnit", None, False, True),
+        ),
+        # ...but a uint8 output dtype min-max rescales into 0-255, so the physical
+        # scale is gone even though the method is "none".
+        (
+            {"normalisation_method": "none", "data_type": "uint8"},
+            CutoutUnits("normalised", None, False, False),
+        ),
+        # An external fitsbolt config overrides normalisation_method entirely.
+        (
+            {
+                "normalisation_method": "none",
+                "external_fitsbolt_cfg": DotMap(
+                    {"normalisation_method": fitsbolt.NormalisationMethod.LINEAR}
+                ),
+            },
+            CutoutUnits("normalised", None, False, False),
+        ),
+        (
+            {
+                "normalisation_method": "linear",
+                "external_fitsbolt_cfg": DotMap(
+                    {"normalisation_method": fitsbolt.NormalisationMethod.CONVERSION_ONLY}
+                ),
+            },
+            CutoutUnits("approx Jy", "Jy", False, True),
+        ),
+        # A user-supplied conversion replaces the AB-zeropoint maths, so the unit
+        # is the user's, not Jy and not the parent tile's.
+        (
+            {"normalisation_method": "none", "user_flux_conversion_function": lambda img, hdr: img},
+            CutoutUnits("approx UserConversionUnit", None, False, True),
+        ),
+        (
+            {
+                "normalisation_method": "none",
+                "flux_conserved_resizing": True,
+                "user_flux_conversion_function": lambda img, hdr: img,
+            },
+            CutoutUnits("UserConversionUnit", None, True, False),
+        ),
+        # The raw-cutout path skips resizing and normalisation altogether, so the
+        # data_type gate does not apply to it.
+        ({"do_only_cutout_extraction": True}, CutoutUnits("Jy", "Jy", True, False)),
+        (
+            {"do_only_cutout_extraction": True, "data_type": "uint8"},
+            CutoutUnits("Jy", "Jy", True, False),
+        ),
+        (
+            {"do_only_cutout_extraction": True, "apply_flux_conversion": False},
+            CutoutUnits("OriginalUnit", None, True, False),
+        ),
+    ],
+)
+def test_resolve_cutout_units(config_overrides, expected):
+    """The unit description follows normalisation, dtype and flux handling."""
+    assert resolve_cutout_units(_units_config(**config_overrides)) == expected
+
+
+@pytest.mark.parametrize("missing_key", ["data_type", "apply_flux_conversion"])
+def test_resolve_cutout_units_requires_config_keys(missing_key):
+    """A missing config key raises rather than silently resolving to a wrong unit."""
+    # normalisation_method="none" so the data_type gate is actually reached.
+    config = _units_config(normalisation_method="none")
+    del config[missing_key]
+
+    # Non-dynamic DotMap attribute access raises AttributeError, not KeyError.
+    with pytest.raises(AttributeError):
+        resolve_cutout_units(config)
+
+
+@pytest.fixture(autouse=True)
+def _clear_wcs_header_cache():
+    """Isolate the module-level WCS header cache between tests.
+
+    ``cutout_writer_fits._wcs_header_cache`` is keyed on ``id(wcs)``; across tests a
+    freed WCS object's id can be reused, returning a stale cached header. Clearing it
+    per test keeps WCS assertions deterministic regardless of execution order.
+    """
+    cutout_writer_fits._wcs_header_cache.clear()
+    yield
+    cutout_writer_fits._wcs_header_cache.clear()
 
 
 class TestCutoutWriterFitsFunctions:
@@ -68,6 +199,13 @@ class TestCutoutWriterFitsFunctions:
 
         return {
             "source_id": "MockSource_00001",
+            # Unit keys are mandatory: write_single_fits_cutout reads them directly
+            # so a caller that forgets them fails loudly instead of writing a
+            # placeholder unit into a science header.
+            "unit": "approx Jy",
+            "bunit": "Jy",
+            "conserved_flux": False,
+            "flux_approximate": True,
             "processed_cutouts": {
                 "VIS": np.random.random((256, 256)).astype(np.float32),
                 "NIR-Y": np.random.random((256, 256)).astype(np.float32),
@@ -82,6 +220,11 @@ class TestCutoutWriterFitsFunctions:
                 "channels": ["VIS", "NIR-Y", "NIR-H"],
                 "processing_timestamp": 1642678800.0,
                 "original_tile": "euclid_tile_001.fits",
+                "tile": "euclid_tile_001.fits",
+                # Extraction origin/size threaded from cutout_extraction (unresized 256 px).
+                "extraction_origin_x": 0,
+                "extraction_origin_y": 0,
+                "extraction_size": 256,
             },
         }
 
@@ -116,16 +259,26 @@ class TestCutoutWriterFitsFunctions:
         assert filename.endswith(".fits")
 
     def test_create_wcs_header(self, mock_cutout_data):
-        """Test WCS header creation."""
-        wcs = mock_cutout_data["wcs_info"]["VIS"]
+        """CRVAL is inherited from the parent tile, not re-tangented at the source."""
+        wcs = mock_cutout_data["wcs_info"]["VIS"]  # parent CRVAL = [150.0, 2.0]
         cutout_shape = (256, 256)
 
-        header = create_wcs_header(cutout_shape, original_wcs=wcs, ra_center=150.0, dec_center=2.0)
+        # Deliberately offset the source from the parent CRVAL so a re-tangenting
+        # regression (CRVAL <- source) would be caught. The extraction origin/size are
+        # threaded in (as they are from cutout_extraction in the real pipeline).
+        header = create_wcs_header(
+            cutout_shape,
+            original_wcs=wcs,
+            ra_source=150.05,
+            dec_source=2.05,
+            extraction_origin_x=0,
+            extraction_origin_y=0,
+            extraction_size=256,
+        )
 
-        assert "CRVAL1" in header
-        assert "CRVAL2" in header
         assert "CRPIX1" in header
         assert "CRPIX2" in header
+        # CRVAL must stay at the parent tile reference, NOT the source position.
         assert header["CRVAL1"] == 150.0
         assert header["CRVAL2"] == 2.0
 
@@ -151,6 +304,220 @@ class TestCutoutWriterFitsFunctions:
             assert "VIS" in ext_names
             assert "NIR-Y" in ext_names
             assert "NIR-H" in ext_names
+
+    def test_write_single_fits_unit_and_consvflx_headers(self, mock_cutout_data, temp_output_dir):
+        """UNIT and CONSVFLX from cutout_data are written to the primary header."""
+        output_path = temp_output_dir / "unit_header.fits"
+
+        cutout_data = {
+            **mock_cutout_data,
+            "unit": "Jy",
+            "bunit": "Jy",
+            "conserved_flux": True,
+            "flux_approximate": False,
+        }
+        success = write_single_fits_cutout(cutout_data, str(output_path), overwrite=True)
+
+        assert success is True
+        with fits.open(output_path) as hdul:
+            assert hdul[0].header["UNIT"] == "Jy"
+            # Assert the raw header value, not bool(...) — a string "T" would
+            # coerce to True and hide a regression in how the card is written.
+            assert hdul[0].header["CONSVFLX"] is True
+
+    def test_write_single_fits_bunit_on_image_hdus(self, mock_cutout_data, temp_output_dir):
+        """BUNIT/FLUXAPPX land on the image HDUs, not the empty primary HDU."""
+        output_path = temp_output_dir / "bunit_header.fits"
+
+        cutout_data = {
+            **mock_cutout_data,
+            "unit": "approx Jy",
+            "bunit": "Jy",
+            "conserved_flux": False,
+            "flux_approximate": True,
+        }
+        assert write_single_fits_cutout(cutout_data, str(output_path), overwrite=True) is True
+
+        with fits.open(output_path) as hdul:
+            assert "BUNIT" not in hdul[0].header
+            for hdu in hdul[1:]:
+                assert hdu.header["BUNIT"] == "Jy"
+                assert hdu.header["FLUXAPPX"] is True
+
+    def test_write_single_fits_omits_bunit_when_unit_unknown(
+        self, mock_cutout_data, temp_output_dir
+    ):
+        """A None bunit writes no BUNIT card rather than a placeholder value."""
+        output_path = temp_output_dir / "bunit_absent.fits"
+
+        cutout_data = {
+            **mock_cutout_data,
+            "unit": "normalised",
+            "bunit": None,
+            "conserved_flux": False,
+            "flux_approximate": False,
+        }
+        assert write_single_fits_cutout(cutout_data, str(output_path), overwrite=True) is True
+
+        with fits.open(output_path) as hdul:
+            assert hdul[0].header["UNIT"] == "normalised"
+            for hdu in hdul[1:]:
+                # FLUXAPPX qualifies BUNIT, so it must not appear without it.
+                assert "BUNIT" not in hdu.header
+                assert "FLUXAPPX" not in hdu.header
+
+    @pytest.mark.parametrize("unit_key", ["unit", "bunit", "conserved_flux", "flux_approximate"])
+    def test_write_single_fits_requires_unit_keys(
+        self, mock_cutout_data, temp_output_dir, unit_key
+    ):
+        """Missing unit metadata raises instead of inventing a placeholder.
+
+        The unit keys are read before the function's broad error handler, so a
+        caller that forgets them gets a KeyError rather than having the bug
+        downgraded to a logged line and a silently dropped file.
+        """
+        output_path = temp_output_dir / "missing_unit.fits"
+        cutout_data = {k: v for k, v in mock_cutout_data.items() if k != unit_key}
+
+        with pytest.raises(KeyError):
+            write_single_fits_cutout(cutout_data, str(output_path), overwrite=True)
+        assert not output_path.exists()
+
+    @pytest.mark.parametrize(
+        (
+            "do_only_cutout_extraction",
+            "normalisation_method",
+            "data_type",
+            "flux_conserved_resizing",
+            "apply_flux_conversion",
+            "expected_unit",
+            "expected_bunit",
+            "expected_consvflx",
+        ),
+        [
+            # Normalisation off with a float32 dtype: pixels keep their scale.
+            (False, "none", "float32", True, True, "Jy", "Jy", True),
+            (False, "none", "float32", True, False, "OriginalUnit", None, True),
+            (False, "none", "float32", False, True, "approx Jy", "Jy", False),
+            (False, "none", "float32", False, False, "approx OriginalUnit", None, False),
+            # ...but a uint8 dtype min-max rescales into 0-255, losing the scale.
+            (False, "none", "uint8", True, True, "normalised", None, True),
+            (False, "none", "uint8", False, True, "normalised", None, False),
+            # Raw-cutout path: skips resizing and normalisation entirely, so the
+            # dtype gate does not apply.
+            (True, "linear", "float32", False, True, "Jy", "Jy", True),
+            (True, "linear", "uint8", False, True, "Jy", "Jy", True),
+            (True, "linear", "float32", False, False, "OriginalUnit", None, True),
+            # Normalisation on: pixels are stretched into the data_type range and
+            # are dimensionless, whatever the flux settings claim.
+            (False, "linear", "float32", False, True, "normalised", None, False),
+            (False, "linear", "float32", True, True, "normalised", None, True),
+            (False, "zscale", "float32", False, False, "normalised", None, False),
+        ],
+    )
+    def test_write_fits_batch_unit_mapping(
+        self,
+        temp_output_dir,
+        do_only_cutout_extraction,
+        normalisation_method,
+        data_type,
+        flux_conserved_resizing,
+        apply_flux_conversion,
+        expected_unit,
+        expected_bunit,
+        expected_consvflx,
+    ):
+        """write_fits_batch maps the processing config to the unit headers it writes."""
+        cutouts_tensor = np.random.random((1, 32, 32, 1)).astype(np.float32)
+        batch_data = [
+            {
+                "cutouts": cutouts_tensor,
+                "channel_names": ["VIS"],
+                "metadata": [
+                    {
+                        "source_id": "UnitSource_001",
+                        "ra": 150.0,
+                        "dec": 2.0,
+                        "tile": "euclid_tile_001.fits",
+                    }
+                ],
+            }
+        ]
+
+        written_files = write_fits_batch(
+            batch_data,
+            str(temp_output_dir),
+            config=_units_config(
+                do_only_cutout_extraction=do_only_cutout_extraction,
+                normalisation_method=normalisation_method,
+                data_type=data_type,
+                flux_conserved_resizing=flux_conserved_resizing,
+                apply_flux_conversion=apply_flux_conversion,
+                channel_weights={"VIS": [1.0]},
+            ),
+            file_naming_template="{source_id}_cutout.fits",
+            create_subdirs=False,
+            overwrite=True,
+        )
+
+        assert len(written_files) == 1
+        with fits.open(written_files[0]) as hdul:
+            assert hdul[0].header["UNIT"] == expected_unit
+            assert hdul[0].header["CONSVFLX"] is expected_consvflx
+            image_hdus = hdul[1:]
+            assert len(image_hdus) == 1
+            if expected_bunit is None:
+                assert "BUNIT" not in image_hdus[0].header
+            else:
+                assert image_hdus[0].header["BUNIT"] == expected_bunit
+
+    def _extraction_only_write(self, batch_data, temp_output_dir):
+        return write_fits_batch(
+            batch_data,
+            str(temp_output_dir),
+            config=_units_config(
+                do_only_cutout_extraction=True,
+                channel_weights={"VIS": [1.0], "NIR-H": [1.0]},
+            ),
+            file_naming_template="{source_id}_cutout.fits",
+            create_subdirs=False,
+            overwrite=True,
+        )
+
+    def test_extraction_only_without_channel_names_key_fails(self, temp_output_dir):
+        """A batch result missing `channel_names` is a broken contract, not a bad count.
+
+        The two used to be indistinguishable: the key was read with a `[]` default, so a
+        producer that never set it surfaced as "0 names for 2 channels" and sent the
+        reader hunting through the channel configuration instead of the producer.
+        """
+        batch_data = [
+            {
+                "cutouts": np.random.random((1, 32, 32, 2)).astype(np.float32),
+                "metadata": [{"source_id": "s0", "ra": 150.0, "dec": 2.0, "tile": "t.fits"}],
+            }
+        ]
+
+        with pytest.raises(KeyError, match="channel_names"):
+            self._extraction_only_write(batch_data, temp_output_dir)
+
+    def test_extraction_only_with_wrong_channel_name_count_fails(self, temp_output_dir):
+        """Losing the labels must not quietly rename named bands to channel_1..N.
+
+        Extraction-only output exists to hand back the input bands as they were; writing
+        generic names for them is the mislabelling the name-resolved channel work removes
+        everywhere else, and it is invisible in the output.
+        """
+        batch_data = [
+            {
+                "cutouts": np.random.random((1, 32, 32, 2)).astype(np.float32),
+                "metadata": [{"source_id": "s0", "ra": 150.0, "dec": 2.0, "tile": "t.fits"}],
+                "channel_names": ["VIS"],
+            }
+        ]
+
+        with pytest.raises(ValueError, match="one channel name per tensor channel"):
+            self._extraction_only_write(batch_data, temp_output_dir)
 
     def test_write_single_fits_with_compression(self, mock_cutout_data, temp_output_dir):
         """Test writing FITS with compression."""
@@ -181,6 +548,7 @@ class TestCutoutWriterFitsFunctions:
                     "source_id": f"BatchSource_{i:03d}",
                     "ra": 150.0 + i * 0.01,
                     "dec": 2.0 + i * 0.01,
+                    "tile": "euclid_tile_001.fits",
                 }
             )
 
@@ -194,7 +562,7 @@ class TestCutoutWriterFitsFunctions:
         written_files = write_fits_batch(
             batch_data,
             str(temp_output_dir),
-            config=DotMap({"do_only_cutout_extraction": False}),
+            config=_units_config(),
             file_naming_template="{source_id}_cutout.fits",
             create_subdirs=False,
             overwrite=True,
@@ -214,6 +582,7 @@ class TestCutoutWriterFitsFunctions:
                 "source_id": "ABC123_source",
                 "ra": 150.0,
                 "dec": 2.0,
+                "tile": "euclid_tile_001.fits",
             }
         ]
 
@@ -227,7 +596,7 @@ class TestCutoutWriterFitsFunctions:
         written_files = write_fits_batch(
             batch_data,
             str(temp_output_dir),
-            config=DotMap({"do_only_cutout_extraction": False}),
+            config=_units_config(),
             create_subdirs=True,
             overwrite=True,
         )
@@ -299,6 +668,7 @@ class TestCutoutWriterFitsFunctions:
             "source_id": "EmptySource",
             "processed_cutouts": {},  # No cutouts
             "metadata": {"ra": 150.0, "dec": 2.0},
+            **_UNIT_KEYS,
         }
 
         output_path = temp_output_dir / "empty.fits"
@@ -309,8 +679,6 @@ class TestCutoutWriterFitsFunctions:
 
     def test_ensure_output_directory_error_handling(self):
         """Test ensure_output_directory with various error conditions."""
-        from cutana.cutout_writer_fits import ensure_output_directory
-
         # Test with invalid permissions path
         with patch("pathlib.Path.mkdir", side_effect=PermissionError("Permission denied")):
             with pytest.raises(PermissionError):
@@ -318,8 +686,6 @@ class TestCutoutWriterFitsFunctions:
 
     def test_generate_fits_filename_comprehensive(self):
         """Test comprehensive filename generation scenarios."""
-        from cutana.cutout_writer_fits import generate_fits_filename
-
         # Test basic functionality with required parameters
         filename = generate_fits_filename(
             "test_source", "{source_id}_cutout.fits", "", {"ra": 150.0, "dec": 2.0}
@@ -364,10 +730,6 @@ class TestCutoutWriterFitsFunctions:
 
     def test_create_wcs_header_comprehensive(self):
         """Test comprehensive WCS header creation scenarios."""
-        from astropy.wcs import WCS
-
-        from cutana.cutout_writer_fits import create_wcs_header
-
         # Test with original WCS
         original_wcs = WCS(naxis=2)
         original_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -375,17 +737,34 @@ class TestCutoutWriterFitsFunctions:
         original_wcs.wcs.crpix = [50.0, 50.0]
         original_wcs.wcs.cdelt = [-0.0001, 0.0001]
 
+        px, py = original_wcs.world_to_pixel_values(151.0, 3.0)
+        x_min = int(px - 64 // 2)
+        y_min = int(py - 64 // 2)
         header = create_wcs_header(
-            (64, 64), original_wcs=original_wcs, ra_center=151.0, dec_center=3.0
+            (64, 64),
+            original_wcs=original_wcs,
+            ra_source=151.0,
+            dec_source=3.0,
+            extraction_origin_x=int(x_min),
+            extraction_origin_y=int(y_min),
+            extraction_size=64,
         )
 
-        assert header["CRPIX1"] == 32.5  # 64/2 + 0.5 (FITS 1-based center)
-        assert header["CRPIX2"] == 32.5  # 64/2 + 0.5 (FITS 1-based center)
-        assert header["CRVAL1"] == 151.0  # Updated center
-        assert header["CRVAL2"] == 3.0  # Updated center
+        # CRVAL/CTYPE are inherited from the parent tile unchanged. The projection
+        # is NOT re-tangented at the source position (doing so keeps the parent CD
+        # matrix at the wrong tangent point and rotates the cutout frame).
+        assert header["CRVAL1"] == 150.0  # parent CRVAL preserved
+        assert header["CRVAL2"] == 2.0  # parent CRVAL preserved
+        # CRPIX is shifted to the extraction origin so the cutout reproduces the
+        # parent sky mapping exactly. Verify that round-trip agreement directly.
+        cut_wcs = WCS(header)
+        for cx, cy in [(0, 0), (63, 63), (10, 50)]:
+            sky_parent = original_wcs.pixel_to_world_values(x_min + cx, y_min + cy)
+            sky_cut = cut_wcs.pixel_to_world_values(cx, cy)
+            assert np.allclose(sky_parent, sky_cut, atol=1e-10)
 
         # Test without original WCS but with coordinates
-        header = create_wcs_header((128, 128), ra_center=150.5, dec_center=2.5, pixel_scale=0.6)
+        header = create_wcs_header((128, 128), ra_source=150.5, dec_source=2.5, pixel_scale=0.6)
 
         assert header["WCSAXES"] == 2
         assert header["CTYPE1"] == "RA---TAN"
@@ -396,8 +775,6 @@ class TestCutoutWriterFitsFunctions:
         assert header["CRPIX2"] == 64.5  # 128/2 + 0.5 (FITS 1-based center)
 
         # Test with error condition - use a new WCS object that hasn't been cached
-        from cutana import cutout_writer_fits
-
         cutout_writer_fits._wcs_header_cache.clear()  # Clear cache so the mock will be invoked
         new_wcs = WCS(naxis=2)
         new_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -408,12 +785,8 @@ class TestCutoutWriterFitsFunctions:
 
     def test_write_fits_batch_edge_cases(self, temp_output_dir):
         """Test write_fits_batch with edge cases."""
-        from cutana.cutout_writer_fits import write_fits_batch
-
         # Test empty batch
-        written_files = write_fits_batch(
-            [], str(temp_output_dir), config=DotMap({"do_only_cutout_extraction": False})
-        )
+        written_files = write_fits_batch([], str(temp_output_dir), config=_units_config())
         assert written_files == []
 
         # Test batch with empty cutouts tensor
@@ -427,7 +800,7 @@ class TestCutoutWriterFitsFunctions:
         written_files = write_fits_batch(
             invalid_batch,
             str(temp_output_dir),
-            config=DotMap({"do_only_cutout_extraction": False}),
+            config=_units_config(),
         )
         assert len(written_files) == 0  # Should skip invalid data
 
@@ -436,14 +809,21 @@ class TestCutoutWriterFitsFunctions:
         valid_batch = [
             {
                 "cutouts": valid_cutouts,
-                "metadata": [{"source_id": "BatchSource_001", "ra": 150.0, "dec": 2.0}],
+                "metadata": [
+                    {
+                        "source_id": "BatchSource_001",
+                        "ra": 150.0,
+                        "dec": 2.0,
+                        "tile": "euclid_tile_001.fits",
+                    }
+                ],
             }
         ]
 
         written_files = write_fits_batch(
             valid_batch,
             str(temp_output_dir),
-            config=DotMap({"do_only_cutout_extraction": False}),
+            config=_units_config(),
             overwrite=True,
         )
         assert len(written_files) == 1
@@ -451,12 +831,11 @@ class TestCutoutWriterFitsFunctions:
 
     def test_error_handling_comprehensive(self, temp_output_dir):
         """Test comprehensive error handling scenarios."""
-        from cutana.cutout_writer_fits import write_single_fits_cutout
-
         mock_data = {
             "source_id": "ErrorTest",
             "processed_cutouts": {"TEST": np.random.random((16, 16))},
             "metadata": {"ra": 150.0, "dec": 2.0},
+            **_UNIT_KEYS,
         }
 
         # Test with FITS writing error
@@ -471,6 +850,7 @@ class TestCutoutWriterFitsFunctions:
             "source_id": "InvalidCutoutTest",
             "processed_cutouts": {"INVALID": "not_an_array"},  # Invalid data type
             "metadata": {},
+            **_UNIT_KEYS,
         }
 
         with patch("astropy.io.fits.ImageHDU", side_effect=Exception("HDU creation failed")):
@@ -478,3 +858,200 @@ class TestCutoutWriterFitsFunctions:
                 invalid_data, str(temp_output_dir / "invalid_cutout.fits"), overwrite=True
             )
             assert success is False
+
+
+class TestCutoutWcsFidelity:
+    """Regression tests for cutout WCS fidelity against the parent tile.
+
+    Guards against the re-tangenting bug where the cutout WCS set CRVAL to the
+    source RA/Dec and CRPIX to the geometric centre while keeping the parent tile's
+    CD matrix. That rotates the cutout frame by the meridian convergence between the
+    tile centre and the source, giving a WCS error that GROWS with distance from the
+    cutout centre (order ~1" at a few-arcmin FOV for sources far from the tile centre).
+
+    The correct construction inherits the parent CRVAL/CD and only shifts CRPIX to the
+    extraction origin, so every cutout pixel maps to the same sky position as the
+    parent tile (to numerical precision).
+    """
+
+    # Declination near the pole: meridian convergence (~ tan(Dec)) is large there,
+    # so the re-tangenting error the fix removes is at its most pronounced.
+    _TILE_DEC = -85.0
+
+    @staticmethod
+    def _euclid_like_tile_wcs():
+        """A MER-VIS-like tile WCS: 19200^2, TAN, 0.1"/px, CD at centre, near the pole.
+
+        Placed at Dec = -85 deg so meridian convergence — and hence the frame
+        rotation a re-tangented WCS would introduce — is strong.
+        """
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        wcs.wcs.crval = [57.9990741, TestCutoutWcsFidelity._TILE_DEC]
+        wcs.wcs.crpix = [9600.0, 9600.0]  # tile centre, FITS 1-based
+        wcs.wcs.cd = [[-2.777777777778e-05, 0.0], [0.0, 2.777777777778e-05]]
+        wcs.wcs.cunit = ["deg", "deg"]
+        wcs.pixel_shape = (19200, 19200)
+        return wcs
+
+    @staticmethod
+    def _max_sky_error_arcsec(header, tile_wcs, x_min, y_min, resize, final_size):
+        """Max separation (arcsec) between cutout-WCS and parent-tile sky positions.
+
+        Ground truth uses the cv2.resize half-pixel-centre convention:
+        parent_pixel = origin + (cutout_pixel + 0.5) / resize - 0.5.
+        """
+        cut_wcs = WCS(header)
+        max_err = 0.0
+        for frac in np.linspace(0.0, 1.0, 11):
+            c = frac * (final_size - 1)
+            parent_x = x_min + (c + 0.5) / resize - 0.5
+            parent_y = y_min + (c + 0.5) / resize - 0.5
+            truth = tile_wcs.pixel_to_world(parent_x, parent_y)
+            got = cut_wcs.pixel_to_world(c, c)
+            max_err = max(max_err, truth.separation(got).to(u.arcsec).value)
+        return max_err
+
+    def test_far_from_centre_no_growing_error(self):
+        """A far-off-centre source cutout must agree with the parent tile to < 1 mas."""
+        tile = self._euclid_like_tile_wcs()
+        # Far off-centre (~0.23 deg) but the 1800 px window stays fully on-tile
+        # (centre in [900, 18300]) so this isolates the rotation term, not clipping.
+        tx, ty = 17800.3, 17800.7
+        target = tile.pixel_to_world(tx, ty)
+        ra_c, dec_c = target.ra.deg, target.dec.deg
+
+        requested = 1800  # 3 arcmin at 0.1"/px
+        # On-tile, unresized window: origin is simply the integer window start.
+        px, py = tile.world_to_pixel_values(ra_c, dec_c)
+        x_min = int(px - requested // 2)
+        y_min = int(py - requested // 2)
+        header = create_wcs_header(
+            (requested, requested),
+            original_wcs=tile,
+            ra_source=ra_c,
+            dec_source=dec_c,
+            extraction_origin_x=int(x_min),
+            extraction_origin_y=int(y_min),
+            extraction_size=requested,
+        )
+        # Parent CRVAL/CD inherited, not re-tangented at the source.
+        assert header["CRVAL1"] == 57.9990741
+        assert header["CRVAL2"] == self._TILE_DEC
+
+        err = self._max_sky_error_arcsec(header, tile, x_min, y_min, 1.0, requested)
+        assert err < 1e-3, f'cutout WCS error {err:.4f}" exceeds 1 mas tolerance'
+
+    @pytest.mark.parametrize(
+        "requested,padding,final",
+        [
+            (400, 1.0, 400),  # no resize, no padding
+            (400, 1.5, 224),  # padding > 1 + downsize
+            (400, 0.8, 224),  # padding < 1 + downsize
+            (300, 2.0, 600),  # padding + upsize
+            (128, 1.0, 128),  # small, exact
+        ],
+    )
+    def test_padding_and_resize_combinations(self, requested, padding, final):
+        """WCS stays exact across padding factors and resize ratios."""
+        tile = self._euclid_like_tile_wcs()
+        tx, ty = 18500.3, 18500.7
+        target = tile.pixel_to_world(tx, ty)
+        ra_c, dec_c = target.ra.deg, target.dec.deg
+
+        # On-tile window: origin is the integer window start (no clip/pad here).
+        px, py = tile.world_to_pixel_values(ra_c, dec_c)
+        ext_size = int(requested * padding)
+        x_min = int(px - ext_size // 2)
+        y_min = int(py - ext_size // 2)
+        resize = final / ext_size
+
+        header = create_wcs_header(
+            (final, final),
+            original_wcs=tile,
+            ra_source=ra_c,
+            dec_source=dec_c,
+            extraction_origin_x=int(x_min),
+            extraction_origin_y=int(y_min),
+            extraction_size=ext_size,
+        )
+
+        err = self._max_sky_error_arcsec(header, tile, x_min, y_min, resize, final)
+        assert err < 1e-3, f'padding={padding} resize={resize:.3f}: WCS error {err:.4f}" too large'
+
+    @staticmethod
+    def _synthetic_tile_hdu(width, height):
+        """Small on-disk-style tile HDU with a high-Dec TAN WCS and known pixel_shape."""
+        hdr = fits.Header()
+        hdr["NAXIS"] = 2
+        hdr["NAXIS1"] = width
+        hdr["NAXIS2"] = height
+        hdr["CTYPE1"] = "RA---TAN"
+        hdr["CTYPE2"] = "DEC--TAN"
+        hdr["CRVAL1"] = 57.999
+        hdr["CRVAL2"] = -51.5
+        hdr["CRPIX1"] = width / 2.0
+        hdr["CRPIX2"] = height / 2.0
+        hdr["CD1_1"] = -2.7778e-05
+        hdr["CD1_2"] = 0.0
+        hdr["CD2_1"] = 0.0
+        hdr["CD2_2"] = 2.7778e-05
+        hdr["CUNIT1"] = "deg"
+        hdr["CUNIT2"] = "deg"
+        data = np.zeros((height, width), dtype=np.float32)
+        return fits.PrimaryHDU(data=data, header=hdr), WCS(hdr)
+
+    @pytest.mark.parametrize(
+        "src_x,src_y,requested,padding",
+        [
+            (184.0, 178.0, 60, 1.0),  # window overruns the tile edge -> clipped + padded
+            (183.0, 177.0, 50, 1.5),  # heavier clip with padding
+            (185.0, 178.0, 20, 1.0),  # fully on-tile (no clip)
+            (182.0, 176.0, 50, 2.0),  # clip + padding upsize
+        ],
+    )
+    def test_real_extraction_marker_roundtrip(self, src_x, src_y, requested, padding):
+        """Drive the REAL extraction path, incl. edge clipping, and check WCS fidelity.
+
+        A marker pixel at a known parent location is extracted through the actual
+        ``extract_cutouts_vectorized_from_extension`` (which clips and centre-pads at
+        tile edges). The cutout WCS built by ``create_wcs_header`` must map the marker's
+        cutout pixel back to its true sky position. This is not self-confirming: the
+        oracle is the parent tile WCS and the real extracted data, not the CRPIX formula.
+        """
+        cutout_writer_fits._wcs_header_cache.clear()
+        width = height = 200
+        hdu, tile = self._synthetic_tile_hdu(width, height)
+        marker_px, marker_py = 185, 178  # 0-based parent pixel
+        hdu.data[marker_py, marker_px] = 1000.0
+        marker_sky = tile.pixel_to_world(marker_px, marker_py)
+
+        target = tile.pixel_to_world(src_x, src_y)
+        ra = np.array([target.ra.deg])
+        dec = np.array([target.dec.deg])
+        # Capture the extraction origin the way the real pipeline threads it to the writer.
+        cutouts, success, _, _, origin_x, origin_y = extract_cutouts_vectorized_from_extension(
+            hdu, tile, ra, dec, np.array([requested], dtype=int), ["s0"], padding_factor=padding
+        )
+        assert cutouts[0] is not None and bool(success[0])
+        cut = cutouts[0]
+
+        # The marker must have been captured for this to test WCS placement.
+        assert cut.max() > 0, "marker not inside extracted window; adjust test params"
+
+        header = create_wcs_header(
+            cut.shape,
+            original_wcs=tile,
+            ra_source=float(ra[0]),
+            dec_source=float(dec[0]),
+            extraction_origin_x=int(origin_x[0]),
+            extraction_origin_y=int(origin_y[0]),
+            extraction_size=int(requested * padding),
+        )
+        cut_wcs = WCS(header)
+        cj, ci = np.unravel_index(int(np.argmax(cut)), cut.shape)  # (row=y, col=x)
+        got = cut_wcs.pixel_to_world(int(ci), int(cj))
+        err = marker_sky.separation(got).to(u.arcsec).value
+        assert err < 1e-3, (
+            f'real-extraction marker WCS error {err:.4f}" (clip/pad handling regressed)'
+        )

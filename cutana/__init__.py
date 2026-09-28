@@ -27,13 +27,16 @@ from loguru import logger
 # Application entry points (Orchestrator, UI) will enable logging when needed
 logger.disable("cutana")
 
-__version__ = "0.2.1"
+__version__ = "0.4.0"
 __author__ = "ESA Datalabs"
 
 # Import main classes for easy access
 # These imports are after logger.disable() to ensure logging is disabled before module initialization
 # Import deployment validation
 from .deployment_validator import deployment_validation  # noqa: E402
+
+# Import direct cutout API
+from .direct_cutout import create_cutouts_direct  # noqa: E402
 
 # Import configuration management functions
 from .get_default_config import (  # noqa: E402
@@ -42,8 +45,13 @@ from .get_default_config import (  # noqa: E402
     load_config_toml,
     save_config_toml,
 )
+from .image_processor import (  # noqa: E402
+    apply_normalisation,
+    combine_channels,
+)
 from .job_tracker import JobTracker  # noqa: E402
 from .orchestrator import Orchestrator  # noqa: E402
+from .source_footprint import check_sources_in_products  # noqa: E402
 from .streaming_orchestrator import StreamingOrchestrator  # noqa: E402
 from .validate_config import validate_config, validate_config_for_processing  # noqa: E402
 
@@ -53,9 +61,13 @@ __all__ = [
     "JobTracker",
     "get_default_config",
     "create_config_from_dict",
+    "create_cutouts_direct",
     "save_config_toml",
     "load_config_toml",
     "validate_config",
     "validate_config_for_processing",
     "deployment_validation",
+    "apply_normalisation",
+    "combine_channels",
+    "check_sources_in_products",
 ]

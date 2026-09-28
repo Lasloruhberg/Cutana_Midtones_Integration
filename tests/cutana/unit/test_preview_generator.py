@@ -109,10 +109,10 @@ class TestLoadSourcesForPreviews:
         mock_catalogue_df.to_csv(catalogue_path, index=False)
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = mock_catalogue_df
+            mock_load_cat.return_value = (mock_catalogue_df, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "tile_001_vis.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
                 "tile_001_nir.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
@@ -140,8 +140,8 @@ class TestLoadSourcesForPreviews:
         empty_df = pd.DataFrame()
         empty_df.to_csv(catalogue_path, index=False)
 
-        with patch("cutana.preview_generator.load_catalogue") as mock_load_cat:
-            mock_load_cat.return_value = empty_df
+        with patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat:
+            mock_load_cat.return_value = (empty_df, 100, False, "test sample")
 
             with pytest.raises(ValueError, match="Empty catalogue provided"):
                 await load_sources_for_previews(str(catalogue_path), mock_config)
@@ -192,10 +192,10 @@ class TestLoadSourcesForPreviews:
         catalogue_df.to_csv(catalogue_path, index=False)
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = catalogue_df
+            mock_load_cat.return_value = (catalogue_df, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "set_a_vis.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
                 "set_a_nir.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
@@ -235,10 +235,10 @@ class TestLoadSourcesForPreviews:
         catalogue_df.to_csv(catalogue_path, index=False)
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = catalogue_df
+            mock_load_cat.return_value = (catalogue_df, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "common_tile.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
             }
@@ -283,10 +283,15 @@ class TestLoadSourcesForPreviews:
 
         for config in test_configs:
             with (
-                patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+                patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
                 patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
             ):
-                mock_load_cat.return_value = mock_catalogue_df.head(10)  # Small sample
+                mock_load_cat.return_value = (
+                    mock_catalogue_df.head(10),
+                    100,
+                    False,
+                    "test sample",
+                )  # Small sample
                 mock_load_fits.return_value = {
                     "test_file.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
                 }
@@ -337,10 +342,10 @@ class TestLoadSourcesForPreviews:
         catalogue_df.to_csv(catalogue_path, index=False)
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = catalogue_df
+            mock_load_cat.return_value = (catalogue_df, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "file1.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
                 "file2.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
@@ -365,10 +370,10 @@ class TestLoadSourcesForPreviews:
         clear_preview_cache()
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = mock_catalogue_df
+            mock_load_cat.return_value = (mock_catalogue_df, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "test_file.fits": (MagicMock(), {"PRIMARY": MagicMock()}),
             }
@@ -430,9 +435,7 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_with_cache(self, populated_cache, mock_config):
         """Test preview generation using cached data."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock processing results in new batch format
             mock_cutout = np.random.rand(256, 256).astype(np.float32)
             # Create batch tensor: (N_sources, H, W, N_channels)
@@ -465,9 +468,7 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_multi_channel(self, populated_cache, mock_config):
         """Test preview generation with multi-channel cutouts."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock multi-channel processing results in new batch format
             channel1 = np.random.rand(256, 256).astype(np.float32)
             channel2 = np.random.rand(256, 256).astype(np.float32)
@@ -500,9 +501,7 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_single_channel(self, populated_cache, mock_config):
         """Test preview generation with single-channel cutouts."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock single-channel processing results in new batch format
             mock_cutout = np.random.rand(256, 256).astype(np.float32)
             # Create batch tensor: (N_sources, H, W, N_channels)
@@ -533,9 +532,7 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_two_channels(self, populated_cache, mock_config):
         """Test preview generation with two-channel cutouts (edge case)."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock two-channel processing results in new batch format
             channel1 = np.random.rand(256, 256).astype(np.float32)
             channel2 = np.random.rand(256, 256).astype(np.float32)
@@ -568,19 +565,17 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_source_selection(self, populated_cache, mock_config):
         """Test random source selection from cache."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock processing that returns results based on input sources in new batch format
-            def mock_process_side_effect(sources_batch, loaded_fits_data, config, profiler=None):
-                if not sources_batch:
+            def mock_process_side_effect(catalogue_df, config):
+                if len(catalogue_df) == 0:
                     return []
 
                 # Create batch tensor for all sources: (N_sources, H, W, N_channels)
                 cutouts_list = []
                 metadata_list = []
 
-                for source in sources_batch:
+                for _, source in catalogue_df.iterrows():
                     # Create individual cutout
                     cutout = np.random.rand(256, 256).astype(np.float32)
                     cutouts_list.append(cutout[:, :, np.newaxis])  # Add channel dimension
@@ -619,12 +614,10 @@ class TestGeneratePreviews:
     @pytest.mark.asyncio
     async def test_generate_previews_error_handling(self, populated_cache, mock_config):
         """Test error handling during preview generation."""
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
-            mock_process.side_effect = Exception("Processing failed")
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
+            mock_process.side_effect = RuntimeError("No valid cutouts were generated")
 
-            with pytest.raises(RuntimeError, match="No valid cutouts were generated from cache"):
+            with pytest.raises(RuntimeError, match="No valid cutouts were generated"):
                 await generate_previews(num_samples=1, size=256, config=mock_config)
 
     # Note: Removed test_generate_previews_channel_weights_conversion as UI now sends
@@ -655,9 +648,7 @@ class TestGeneratePreviews:
             }
         )
 
-        with patch(
-            "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-        ) as mock_process:
+        with patch("cutana.preview_generator.create_cutouts_direct") as mock_process:
             # Mock processing results
             mock_cutout = np.random.rand(256, 256).astype(np.float32)
             cutouts_batch = mock_cutout[:, :, np.newaxis][
@@ -685,7 +676,7 @@ class TestGeneratePreviews:
             # Verify processing was called with channel weights in dictionary format
             assert mock_process.called
             call_args = mock_process.call_args
-            preview_config = call_args[0][2]  # Third argument is the config
+            preview_config = call_args[0][1]  # Second argument is the config
 
             # Verify channel weights are passed correctly as dictionary
             assert hasattr(preview_config, "channel_weights")
@@ -735,51 +726,31 @@ class TestIntegration:
         )
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
-            patch(
-                "cutana.preview_generator._process_sources_batch_vectorized_with_fits_set"
-            ) as mock_process,
+            patch("cutana.preview_generator.create_cutouts_direct") as mock_direct,
         ):
             # Set up mocks
-            mock_load_cat.return_value = catalogue_data
+            mock_load_cat.return_value = (catalogue_data, 100, False, "test sample")
             mock_load_fits.return_value = {
                 "integration_test.fits": (MagicMock(), {"PRIMARY": MagicMock()})
             }
 
-            def mock_process_side_effect(sources_batch, loaded_fits_data, config, profiler=None):
-                if not sources_batch:
-                    return []
-
-                # Create batch tensor for all sources: (N_sources, H, W, N_channels)
-                cutouts_list = []
-                metadata_list = []
-
-                for source in sources_batch:
-                    # Create individual cutout
-                    cutout = np.random.rand(256, 256).astype(np.float32)
-                    cutouts_list.append(cutout[:, :, np.newaxis])  # Add channel dimension
-
-                    metadata_list.append(
-                        {
-                            "source_id": source["SourceID"],
-                            "ra": source["RA"],
-                            "dec": source["Dec"],
-                            "processing_timestamp": 1642678800.0,
-                        }
-                    )
-
-                # Stack into batch tensor
-                cutouts_batch = np.stack(cutouts_list, axis=0)  # Shape: (N_sources, 256, 256, 1)
-
-                return [
+            def mock_direct_side_effect(catalogue_df, config):
+                n = len(catalogue_df)
+                cutouts_batch = np.random.rand(n, 256, 256, 1).astype(np.float32)
+                metadata_list = [
                     {
-                        "cutouts": cutouts_batch,
-                        "metadata": metadata_list,
+                        "source_id": row["SourceID"],
+                        "ra": row["RA"],
+                        "dec": row["Dec"],
+                        "processing_timestamp": 1642678800.0,
                     }
+                    for _, row in catalogue_df.iterrows()
                 ]
+                return [{"cutouts": cutouts_batch, "metadata": metadata_list}]
 
-            mock_process.side_effect = mock_process_side_effect
+            mock_direct.side_effect = mock_direct_side_effect
 
             # Step 1: Load sources for previews
             cache_result = await load_sources_for_previews(str(catalogue_path), config)
@@ -828,10 +799,10 @@ class TestIntegration:
         config = DotMap({"selected_extensions": [{"name": "VIS", "ext": "PRIMARY"}]})
 
         with (
-            patch("cutana.preview_generator.load_catalogue") as mock_load_cat,
+            patch("cutana.preview_generator.read_catalogue_sample") as mock_load_cat,
             patch("cutana.preview_generator.load_fits_sets") as mock_load_fits,
         ):
-            mock_load_cat.return_value = catalogue_df
+            mock_load_cat.return_value = (catalogue_df, 100, False, "test sample")
             # Mock should only return files for the top 1 selected FITS set
             # Set A has most sources (334 vs 333 each for B and C), so it's selected
             mock_load_fits.return_value = {

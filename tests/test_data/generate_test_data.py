@@ -7,8 +7,7 @@
 """
 Consolidated Euclid-compliant Mock Test Data Generator for Cutana
 
-This script generates mock astronomical test data following ESA Euclid mission formats
-as documented in docs/euclid_fits.md. It replaces all previous mock data generation scripts.
+This script generates mock astronomical test data following ESA Euclid mission formats. It replaces all previous mock data generation scripts.
 
 Features:
 - Euclid-compliant FITS file formats (catalogs and mosaics)
@@ -34,6 +33,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
@@ -433,9 +434,6 @@ def generate_tile_data(
                 dec = float(row["DECLINATION"])
 
                 # Convert RA/Dec to pixel coordinates
-                from astropy import units as u
-                from astropy.coordinates import SkyCoord
-
                 coord = SkyCoord(ra=ra * u.degree, dec=dec * u.degree, frame="icrs")
                 pixel_x, pixel_y = wcs.world_to_pixel(coord)
                 source_pixel_positions.append((float(pixel_x), float(pixel_y)))
@@ -648,7 +646,7 @@ Examples:
         )
 
         logger.success(f"🎉 Generation completed in {generation_time:.1f}s")
-        logger.info(f"📦 Total data size: {total_size / (1024*1024):.1f} MB")
+        logger.info(f"📦 Total data size: {total_size / (1024 * 1024):.1f} MB")
         logger.info(f"📂 Files available in: {output_path}")
 
         return 0

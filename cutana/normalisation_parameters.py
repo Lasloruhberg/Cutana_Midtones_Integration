@@ -20,6 +20,7 @@ The parameters are organized by normalization method and include:
 from typing import Any, Dict, Tuple
 
 import fitsbolt
+import numpy as np
 from dotmap import DotMap
 from loguru import logger
 
@@ -34,6 +35,11 @@ class NormalisationDefaults:
     PERCENTILE = 99.8  # Percentile cutting applied to all methods. Default value from Euclid bulk cutouts documentation.
     N_SAMPLES = 1000  # Default for ZScale n_samples. Values are Astropy default valus.
     CONTRAST = 0.25
+    # Pixels subsampled per channel when estimating the asinh percentile bounds. None means
+    # exact: percentiles over all pixels, matching fitsbolt's own default and the output of
+    # every cutana release before the knob existed. Setting it trades a bright-tail bias for
+    # speed, which is a caller's decision to make, not a default to inherit silently.
+    ASINH_N_SAMPLES = None
 
     # Method-specific defaults for unified 'a' parameter
     ASINH_A = 0.1  # Default ASINH transition parameter. Default value from Astropy documentation.
@@ -68,6 +74,11 @@ class NormalisationRanges:
     # ZScale parameters
     N_SAMPLES_MIN = 100
     N_SAMPLES_MAX = 10000
+
+    # Asinh percentile subsample size (pixels per channel). Lower = faster but more bright-tail
+    # bias; upper bound is generous so large cutouts can still request a near-exact estimate.
+    ASINH_N_SAMPLES_MIN = 100
+    ASINH_N_SAMPLES_MAX = 1000000
 
     CONTRAST_MIN = 0.01
     CONTRAST_MAX = 1.0
@@ -178,6 +189,7 @@ def get_default_normalisation_config() -> DotMap:
             "percentile": NormalisationDefaults.PERCENTILE,
             "a": NormalisationDefaults.ASINH_A,  # Default to ASINH
             "n_samples": NormalisationDefaults.N_SAMPLES,
+            "asinh_n_samples": NormalisationDefaults.ASINH_N_SAMPLES,
             "contrast": NormalisationDefaults.CONTRAST,
             "crop_enable": NormalisationDefaults.CROP_ENABLE,
             "crop_height": NormalisationDefaults.CROP_HEIGHT,
@@ -249,12 +261,12 @@ def build_fitsbolt_params_from_external_cfg(
 
     elif method == fitsbolt.NormalisationMethod.LOG:
         fitsbolt_params["norm_log_scale_a"] = norm_cfg.log_scale_a
-        max_val = getattr(norm_cfg, "maximum_value", None)
-        min_val = getattr(norm_cfg, "minimum_value", None)
-        if max_val is not None:
-            fitsbolt_params["norm_maximum_value"] = max_val
-        if min_val is not None:
-            fitsbolt_params["norm_minimum_value"] = min_val
+        # `maximum_value` / `minimum_value` are optional fitsbolt parameters
+        # on the externally-provided config; forward them only when present.
+        if "maximum_value" in norm_cfg:
+            fitsbolt_params["norm_maximum_value"] = norm_cfg.maximum_value
+        if "minimum_value" in norm_cfg:
+            fitsbolt_params["norm_minimum_value"] = norm_cfg.minimum_value
 
     elif method == fitsbolt.NormalisationMethod.ZSCALE:
         fitsbolt_params["norm_zscale_n_samples"] = norm_cfg.zscale.n_samples
@@ -264,6 +276,12 @@ def build_fitsbolt_params_from_external_cfg(
         # ASINH uses per-channel scale and clip values
         fitsbolt_params["norm_asinh_scale"] = norm_cfg.asinh_scale
         fitsbolt_params["norm_asinh_clip"] = norm_cfg.asinh_clip
+        # `asinh_n_samples` is optional on the externally-provided config (older
+        # callers and TOML round-trips may omit it), so check explicitly rather
+        # than using a getattr fallback. When present it lets AnomalyMatch drive
+        # the asinh percentile subsampling (typically more aggressively).
+        if "asinh_n_samples" in norm_cfg:
+            fitsbolt_params["norm_asinh_n_samples"] = norm_cfg.asinh_n_samples
 
     elif method == fitsbolt.NormalisationMethod.MIDTONES:
         raise ValueError(
@@ -277,15 +295,60 @@ def build_fitsbolt_params_from_external_cfg(
             "Supported methods: CONVERSION_ONLY, LOG, ZSCALE, ASINH."
         )
 
-    # Handle crop for maximum value if configured
-    # Use getattr to safely check if the key exists (may be missing after TOML serialization)
-    crop_for_max = getattr(norm_cfg, "crop_for_maximum_value", None)
-    if crop_for_max is not None:
-        fitsbolt_params["norm_crop_for_maximum_value"] = crop_for_max
+    # `crop_for_maximum_value` is optional on the externally-provided fitsbolt
+    # config (may be absent after TOML serialization), so check explicitly
+    # instead of using a getattr fallback.
+    if "crop_for_maximum_value" in norm_cfg:
+        fitsbolt_params["norm_crop_for_maximum_value"] = norm_cfg.crop_for_maximum_value
+
+    # Set fitsbolt's output_dtype from cutana's external config
+    # Note:
+    #  In the validation step we make sure that this parameter
+    #  is always present (if external_cfg is not None) and equal
+    #  to cutana's data_type parameter in order to avoid
+    #  inconsistencies.
+    fitsbolt_params["output_dtype"] = external_cfg.output_dtype
 
     logger.debug(f"Built fitsbolt params from external config: method={method}")
 
     return fitsbolt_params
+
+
+def preserves_physical_scale(config: DotMap) -> bool:
+    """Whether normalisation leaves the pixel values on their physical scale.
+
+    Only fitsbolt's ``CONVERSION_ONLY`` can preserve the scale, and even then only
+    when the dtype conversion is a no-op: ``_conversiononly_normalisation`` returns
+    the array untouched when the input dtype already matches ``output_dtype`` and
+    is floating, but min-max rescales into the integer range otherwise. Every other
+    method stretches the pixels by construction.
+
+    ``external_fitsbolt_cfg`` takes precedence over ``normalisation_method`` in
+    ``apply_normalisation``, so the effective method is read with the same
+    precedence here — otherwise the header would describe a normalisation that
+    never ran.
+
+    Args:
+        config: Processing configuration.
+
+    Returns:
+        True if the pixel values keep their physical scale through normalisation.
+
+    Raises:
+        AttributeError: If a required configuration key is missing (DotMap
+            attribute access on a non-dynamic config).
+    """
+    external_cfg = config.external_fitsbolt_cfg
+    if external_cfg is not None and "normalisation_method" in external_cfg:
+        conversion_only = (
+            external_cfg.normalisation_method == fitsbolt.NormalisationMethod.CONVERSION_ONLY
+        )
+    else:
+        conversion_only = config.normalisation_method.lower() == "none"
+
+    # convert_cfg_to_fitsbolt_cfg maps data_type to uint8 or float32; cutouts reach
+    # normalisation as float32, so only float32 output leaves them unscaled.
+    return conversion_only and config.data_type == "float32"
 
 
 def convert_cfg_to_fitsbolt_cfg(config: DotMap, num_channels: int = 1) -> Dict[str, Any]:
@@ -310,7 +373,7 @@ def convert_cfg_to_fitsbolt_cfg(config: DotMap, num_channels: int = 1) -> Dict[s
     if method == "log":
         norm_method = fitsbolt.NormalisationMethod.LOG
     elif method == "linear":
-        norm_method = fitsbolt.NormalisationMethod.CONVERSION_ONLY
+        norm_method = fitsbolt.NormalisationMethod.LINEAR
     elif method == "asinh":
         norm_method = fitsbolt.NormalisationMethod.ASINH
     elif method == "zscale":
@@ -358,8 +421,31 @@ def convert_cfg_to_fitsbolt_cfg(config: DotMap, num_channels: int = 1) -> Dict[s
 
         fitsbolt_params["norm_asinh_scale"] = norm_scale
         fitsbolt_params["norm_asinh_clip"] = norm_clip
+        # Membership on the plain dict, then the value. Neither check alone is enough:
+        # a non-dynamic DotMap raises a bare `KeyError` on bracket access, which is the
+        # shape the widget itself produced, while a dynamic one invents the key and
+        # *stores what it invented*, so a config that lost it can still carry an empty
+        # DotMap that passes membership. `toDict()` invents nothing either way.
+        block = config.normalisation.toDict()
+        if "asinh_n_samples" not in block:
+            raise ValueError(
+                "config.normalisation.asinh_n_samples is missing. get_default_config() "
+                "always sets it, so this config was rebuilt somewhere that dropped the key."
+            )
+        # None (the default) leaves fitsbolt computing exact all-pixel percentiles; an int
+        # opts into a strided subsample of that many pixels per channel, faster but biased
+        # in the bright tail (fitsbolt norm_asinh_n_samples). `bool` is excluded on purpose:
+        # it passes `isinstance(x, int)` and would reach fitsbolt as a one-pixel subsample.
+        asinh_n_samples = block["asinh_n_samples"]
+        if asinh_n_samples is not None and type(asinh_n_samples) is not int:
+            raise ValueError(
+                "config.normalisation.asinh_n_samples must be an int or None, got "
+                f"{type(asinh_n_samples).__name__}."
+            )
+        fitsbolt_params["norm_asinh_n_samples"] = asinh_n_samples
         logger.debug(
-            f"ASINH normalization: a={a}, percentile={percentile}, channels={num_channels}"
+            f"ASINH normalization: a={a}, percentile={percentile}, channels={num_channels}, "
+            f"n_samples={asinh_n_samples}"
         )
     elif method == "midtones":
         # Midtones uses 'a' as desired_mean and percentile for clipping
@@ -368,4 +454,10 @@ def convert_cfg_to_fitsbolt_cfg(config: DotMap, num_channels: int = 1) -> Dict[s
         logger.debug(f"MIDTONES normalization: desired_mean={a}, percentile={percentile}")
 
     fitsbolt_params["num_workers"] = 1  # Single-threaded processing; parallelism handled externally
+
+    # Set fitsbolt's output_dtype from cutana's config
+    # See this link below for reference about possible data types supported by fitsbolt:
+    #  https://github.com/Lasloruhberg/fitsbolt/blob/04e6adc221543143a6f1209cd95b6cab86f2e9ed/fitsbolt/normalisation/normalisation.py#L61-L73
+    fitsbolt_params["output_dtype"] = np.uint8 if config.data_type == "uint8" else np.float32
+
     return fitsbolt_params

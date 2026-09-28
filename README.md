@@ -364,9 +364,9 @@ The Midtones Transfer Function (MTF) adjusts image brightness by mapping the mea
 from cutana import get_default_config
 
 config = get_default_config()
-config.normalisation_method = 'midtones'
-config.normalisation.percentile = 99.8             # Percentile clipping (default)
-config.normalisation.a = 0.2                       # Desired mean brightness (default for midtones)
+config.normalisation_method = "midtones"
+config.normalisation.percentile = 99.8  # Percentile clipping (default)
+config.normalisation.a = 0.2  # Desired mean brightness (default for midtones)
 ```
 
 ## Performance Considerations
